@@ -13,6 +13,7 @@
   <p class="lede">Every protocol that <strong>records no token</strong>, ranked by what its launch would be worth — and exactly how to farm it.</p>
   <div class="stats" id="stats"></div>
   <p class="evidence" id="evidence"></p>
+  <p class="evidence" id="evidence2"></p>
   <div class="accounting" id="accounting"></div>
 </header>
 
@@ -33,10 +34,18 @@
     <p class="count" id="count"></p>
   </section>
 
+  <section class="sliders" aria-label="Farm scenario">
+    <label>Deposit <output id="depOut">$10,000</output><input id="dep" type="range" min="1000" max="50000" step="1000" value="10000"></label>
+    <label>Drop share <output id="shareOut">2.0%</output><input id="share" type="range" min="0.5" max="5" step="0.5" value="2"></label>
+    <label>Gas <output id="gasOut">1×</output><input id="gas" type="range" min="0.5" max="3" step="0.25" value="1"></label>
+    <p class="scen">Net and verdict follow the sliders.</p>
+  </section>
+
   <section class="board">
     <table id="board">
       <thead><tr>
         <th data-sort="rank" class="num sorted-desc">#</th>
+        <th data-sort="rank_lo" class="num">Rank range</th>
         <th data-sort="name">Protocol</th>
         <th data-sort="implied_value_usd" class="num">Implied value</th>
         <th data-sort="token_odds" class="num">Token odds</th>
@@ -64,8 +73,14 @@
     <div class="d-grid" id="d-grid"></div>
     <h3>How the value is built</h3>
     <table class="breakdown"><tbody id="d-break"></tbody></table>
-    <h3>Farm economics — a $10,000 deposit</h3>
+    <h3 id="d-val-title">Model validation</h3>
+    <table class="peers abl"><tbody id="d-ablation"></tbody></table>
+    <p class="note" id="d-ablation-note"></p>
+    <h3 id="d-econ-title">Farm economics — a $10,000 deposit</h3>
     <div class="econ" id="d-econ"></div>
+    <h3 id="d-matrix-title">Net by deposit × drop share</h3>
+    <table class="peers matrix"><tbody id="d-matrix"></tbody></table>
+    <p class="note">Same farm formula at each deposit and drop share, fees at standard gas.</p>
     <h3>Farm plan — what to do, what it costs, how long it takes</h3>
     <ol class="farm" id="d-farm"></ol>
     <h3 id="d-peers-title">Nearest priced peers</h3>
@@ -75,10 +90,12 @@
 
   <section class="method">
     <h2>Methodology</h2>
-    <p><strong>Implied value = curve(TVL) × category factor × growth factor × age factor × token odds.</strong> The size curve is a log-log regression of market cap on TVL, fitted at runtime from the 128 token-trading protocols in the snapshot (ln(mcap) = 6.96 + 0.52 × ln(TVL), R² 0.19): a big protocol carries a lower multiple than a small one, so a $2.75B protocol is not priced at 275× a $10M one. The category factor is the median of (actual mcap / curve-predicted mcap) over the token-trading protocols in the same category, shrunk toward 1.0 and clamped to [0.3, 2.5]; a category counts only with at least 3 trading comps, else no adjustment. The growth factor is <code>1 + clamp(change_7d, −50, +100) / 100 × 0.5</code>. The age factor is <code>1 + 0.15 × ln(1 + years since listed_at)</code>, capped at 1.5, with the snapshot's median age (1.85 years) standing in where no listing date is recorded. Token odds are the peer-group rate: the share of protocols in the same category, listed within a year and within one decade of TVL, that record a token, shrunk toward the global rate with a prior weight of 20. The P25–P75 value range comes from the spread of peer multiples in the row's category.</p>
-    <p><strong>Farm economics, one scenario for every row:</strong> a $10,000 deposit. The drop pool is 2% of the implied value; the farming pool is 5% of TVL and the farmer's share is the deposit over it; fees are one transaction per farm step that names gas, at $5.00 on Ethereum, $0.01 on Solana, $3.00 on Bitcoin and $0.25 on every other chain; time is the steps' stated minutes, each counted once. Net = modelled drop × token odds − fees. <strong>FARM</strong> means net over $750 and over $500 an hour — the top decile of modelled nets under this scenario (the median row nets $322). <strong>SKIP</strong> means net under $100, under 1% of the deposit. The verdict ranks farming, not launch value: the biggest launches are the worst farms, because a $10,000 stake is a drop in their TVL.</p>
-    <p><strong>How good is the model?</strong> Held out, the size curve misses by ×3.4 (leave-one-out) and ×3.1 (walk-forward, fitted on tokens listed before 2025-01-01 and tested on later ones), against ×5.1 and ×5.4 for a flat median multiple. Token odds score 0.224 (Brier) against 0.248 for the base rate — they discriminate weakly, so they are a rough guide, not a prediction. The curve explains about a fifth of the variation in market caps, which is why the value ranges are wide.</p>
-    <p>Coverage: the board holds <strong>every</strong> protocol in the snapshot that records no token — all 40 watchlist protocols (TVL ≥ $50M, no token recorded, not a wrapped, staked or bridged product) plus all 158 more. A protocol is on this board because its DefiLlama record carries no token — neither a gecko id, nor a symbol, nor a market cap — which is not proof it has none. Of the 758 protocols in the snapshot, 416 already record a token and 144 are excluded by the watchlist rule (bridges, staking, CEX products, versioned or wrapped names).</p>
+    <p><strong>Implied value = curve(TVL) × category factor × growth factor × age factor × token odds.</strong> The size curve is a log-log regression of market cap on TVL, fitted at runtime from the 128 token-trading protocols in the snapshot (ln(mcap) = 6.96 + 0.52 × ln(TVL), R² 0.19): a big protocol carries a lower multiple than a small one. The category factor is the median of (actual mcap / curve-predicted mcap) over the token-trading protocols in the same category, shrunk toward 1.0 and clamped to [0.3, 2.5]; a category counts only with at least 3 trading comps, else no adjustment. The growth factor is <code>1 + clamp(change_7d, −50, +100) / 100 × 0.5</code>. The age factor is <code>1 + 0.15 × ln(1 + years since listed_at)</code>, capped at 1.5, with the snapshot's median age (1.85 years) where no listing date is recorded. Token odds are the peer-group rate: the share of protocols in the same category, listed within a year and within one decade of TVL, that record a token, shrunk toward the global rate (prior 20). The P25–P75 range is the spread of peer multiples in the row's category.</p>
+    <p><strong>Farm economics, one scenario for every row:</strong> a $10,000 deposit. The drop pool is 2% of the implied value; the farming pool is 5% of TVL and the farmer's share is the deposit over it; fees are one gas transaction per farm step that names gas: $5.00 Ethereum, $0.01 Solana, $3.00 Bitcoin, $0.25 elsewhere; time is the steps' stated minutes, each counted once. Net = modelled drop × token odds − fees. <strong>FARM</strong> means net over $750 and over $500 an hour — the top decile of modelled nets under this scenario (the median row nets $322). <strong>SKIP</strong> means net under $100, under 1% of the deposit. The verdict ranks farming, not launch value: the biggest launches are the worst farms, because a $10,000 stake is a drop in their TVL.</p>
+    <p><strong>How good is the model?</strong> The evidence strip above gives the held-out numbers: the curve beats a flat multiple on both leave-one-out and walk-forward tests. Token odds score 0.224 (Brier) against 0.248 for the base rate — they discriminate weakly, so they are a rough guide, not a prediction. The curve explains about a fifth of the variation in market caps, which is why the value ranges are wide.</p>
+    <p><strong>Opportunity cost:</strong> every farm box carries a T-bill line — the same deposit in a US 3-month Treasury bill over the 30-day minimum hold the farm plans ask for, at the rate and source date in the box. A farm has to beat the risk-free rate, not just its fees.</p>
+    <p><strong>Sliders and the matrix:</strong> the sliders above the board recompute net and verdict live from the same formulas — the board's verdict is a scenario, not a fact. The detail matrix shows the same formula at $1,000 / $10,000 / $50,000 and 1% / 2% / 5% drop shares.</p>
+    <p>Coverage: the board holds <strong>every</strong> protocol in the snapshot that records no token — all 40 watchlist protocols (TVL ≥ $50M, no token recorded, not a wrapped, staked or bridged product) plus 158 more. A protocol is here because its DefiLlama record carries no token — no gecko id, no symbol, no market cap — which is not proof it has none. Of the 758 protocols, 416 already record a token and 144 are excluded by the watchlist rule (bridges, staking, CEX products, versioned or wrapped names).</p>
   </section>
 </main>
 

@@ -116,6 +116,8 @@ export interface FarmEconomics {
   hours: number;
   gas_per_tx_usd: number;
   txs: number;
+  /** What the same deposit would earn in a US 3-month Treasury bill over the same farm duration. */
+  tbill_usd: number;
 }
 
 export type Verdict = 'FARM' | 'MARGINAL' | 'SKIP';
@@ -147,6 +149,9 @@ export interface BoardRow {
   verdict: Verdict;
   net_usd: number;
   net_per_hour_usd: number;
+  /** P5–P95 rank across the bootstrap refits: how sure this rank is. */
+  rank_lo: number;
+  rank_hi: number;
   econ: FarmEconomics;
   peers: Peer[];
 }
@@ -170,6 +175,21 @@ export interface Evidence {
   brier_base: number;
 }
 
+/** One row of the term-by-term ablation: the LOO median miss of the model with terms added in order. */
+export interface AblationRow {
+  label: string;
+  loo_miss: number;
+  note: string;
+}
+
+/** The fitted factor ranges each term actually spans on this board. */
+export interface TermRanges {
+  category: [number, number];
+  growth: [number, number];
+  age: [number, number];
+  odds: [number, number];
+}
+
 export interface Accounting {
   ranked: number;
   token_recorded: number;
@@ -187,6 +207,12 @@ export interface Assumptions {
   verdict_farm_per_hour_usd: number;
   verdict_skip_net_usd: number;
   odds_prior_weight: number;
+  /** US 3-month Treasury bill, Federal Reserve H.15, 19 Nov 2026: the opportunity cost of farming. */
+  tbill_rate: number;
+  tbill_as_of: string;
+  tbill_hold_days: number;
+  bootstrap_draws: number;
+  bootstrap_seed: number;
 }
 
 export interface RadarData {
@@ -204,6 +230,9 @@ export interface RadarData {
   evidence: Evidence;
   accounting: Accounting;
   assumptions: Assumptions;
+  /** Term-by-term ablation (LOO median miss, terms added in order) and the factor range each term spans. */
+  ablation: AblationRow[];
+  term_ranges: TermRanges;
 }
 
 /** A category factor is trusted only with this many trading comps. */
@@ -220,6 +249,18 @@ export const VERDICT_SKIP_NET_USD = 100;
 /** Typical gas per transaction, in dollars, by chain. */
 export const GAS_USD: Record<string, number> = { Ethereum: 5, Solana: 0.01, Bitcoin: 3 };
 export const GAS_DEFAULT_USD = 0.25;
+/** Bootstrap refits of the size curve: 200 draws, fixed seed, so every run agrees. */
+export const BOOTSTRAP_DRAWS = 200;
+export const BOOTSTRAP_SEED = 20261114;
+/** Opportunity cost of farming: the US 3-month Treasury bill, Federal Reserve H.15, 19 Nov 2026. */
+export const TBILL_RATE = 0.0416;
+export const TBILL_AS_OF = '2026-11-19';
+/** The farm plans ask for at least a 30-day hold, so the T-bill comparison
+ * runs over 30 days — a floor on the opportunity cost, since some plans ask
+ * for 60+ days. The hands-on time (hours) is far shorter; pricing the
+ * T-bill over hands-on minutes would understate what the locked deposit
+ * gives up, so the comparison uses the hold, stated here and on the page. */
+export const TBILL_HOLD_DAYS = 30;
 
 const EXCLUDED_CATEGORIES = new Set([
   'Bridge',
@@ -586,13 +627,14 @@ function curveValue(fit: CurveFit, tvl: number): number {
   return Math.exp(fit.intercept + fit.slope * Math.log(Math.max(1, tvl)));
 }
 
-/** Median (actual mcap / curve-predicted mcap) per category, shrunk toward 1.0 and clamped. */
-function categoryFactors(snapshot: Snapshot, fit: CurveFit): Record<string, { factor: number; comps: number }> {
+/** Median (actual mcap / curve-predicted mcap) per category, shrunk toward 1.0 and clamped, from any comp list. */
+function categoryFactorsFrom(comps: Protocol[], fit: CurveFit): Record<string, { factor: number; comps: number }> {
   const byCategory = new Map<string, number[]>();
-  for (const p of fitComps(snapshot)) {
+  for (const p of comps) {
+    if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
     const key = p.category ?? '(none)';
     const list = byCategory.get(key) ?? [];
-    list.push(p.mcap_usd! / curveValue(fit, p.tvl_usd));
+    list.push(p.mcap_usd / curveValue(fit, p.tvl_usd));
     byCategory.set(key, list);
   }
   const out: Record<string, { factor: number; comps: number }> = {};
@@ -603,6 +645,81 @@ function categoryFactors(snapshot: Snapshot, fit: CurveFit): Record<string, { fa
     const w = values.length / (values.length + 8);
     const factor = clamp(1 + (med - 1) * w, 0.3, 2.5);
     out[key] = { factor, comps: values.length };
+  }
+  return out;
+}
+
+/** Median (actual mcap / curve-predicted mcap) per category, shrunk toward 1.0 and clamped. */
+function categoryFactors(snapshot: Snapshot, fit: CurveFit): Record<string, { factor: number; comps: number }> {
+  return categoryFactorsFrom(fitComps(snapshot), fit);
+}
+
+/** Deterministic PRNG (mulberry32): the bootstrap draws are identical on every run. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Bootstrap rank ranges: resample the traded comps with replacement, refit
+ * the curve and the category factors each draw, re-rank the whole board, and
+ * take the P5–P95 rank per row. A wide interval means the rank is fragile;
+ * a narrow one means the curve is sure of it.
+ */
+function bootstrapRanks(
+  snapshot: Snapshot,
+  scored: Scored[],
+): Map<string, { lo: number; hi: number }> {
+  const comps = fitComps(snapshot);
+  const n = comps.length;
+  const xs = comps.map((p) => Math.log(p.tvl_usd));
+  const ys = comps.map((p) => Math.log(p.mcap_usd!));
+  const rand = mulberry32(BOOTSTRAP_SEED);
+  const ranks = new Map<string, number[]>();
+  for (const s of scored) ranks.set(s.slug, []);
+  for (let d = 0; d < BOOTSTRAP_DRAWS; d++) {
+    const sx: number[] = [];
+    const sy: number[] = [];
+    const sampled: Protocol[] = [];
+    for (let i = 0; i < n; i++) {
+      const j = Math.floor(rand() * n);
+      sx.push(xs[j]!);
+      sy.push(ys[j]!);
+      sampled.push(comps[j]!);
+    }
+    const f = ols(sx, sy);
+    const drawFit: CurveFit = {
+      slope: f.slope,
+      intercept: f.intercept,
+      r2: f.r2,
+      n_comps: n,
+      multiple_at_100m: Math.exp(f.intercept + f.slope * Math.log(100_000_000)) / 100_000_000,
+    };
+    const factors = categoryFactorsFrom(sampled, drawFit);
+    const vals = scored.map((s) => {
+      const key = s.category ?? '(none)';
+      const mult = factors[key] !== undefined ? factors[key]!.factor : 1;
+      return {
+        slug: s.slug,
+        v: curveValue(drawFit, s.tvl_usd) * mult * s.growthFactor * s.ageFactor * s.odds,
+        tvl: s.tvl_usd,
+      };
+    });
+    vals.sort((a, b) => b.v - a.v || b.tvl - a.tvl || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+    vals.forEach((row, i) => ranks.get(row.slug)!.push(i + 1));
+  }
+  const out = new Map<string, { lo: number; hi: number }>();
+  for (const [slug, rs] of ranks) {
+    out.set(slug, {
+      lo: clamp(Math.round(percentile(rs, 0.05)), 1, scored.length),
+      hi: clamp(Math.round(percentile(rs, 0.95)), 1, scored.length),
+    });
   }
   return out;
 }
@@ -730,6 +847,10 @@ function scoreProtocol(
   const farmerDrop = dropPool * share;
   const net = farmerDrop * odds - fees;
   const netPerHour = net / hours;
+  // The same deposit in a US 3-month Treasury bill over the plan's minimum
+  // 30-day hold: the opportunity cost of farming. (Hands-on time is under
+  // an hour; the deposit itself is locked for the hold.)
+  const tbill = (DEPOSIT_USD * TBILL_RATE * TBILL_HOLD_DAYS) / 365.25;
   const verdict: Verdict =
     net > VERDICT_FARM_NET_USD && netPerHour > VERDICT_FARM_PER_HOUR_USD
       ? 'FARM'
@@ -757,6 +878,7 @@ function scoreProtocol(
       hours,
       gas_per_tx_usd: gas,
       txs: plan.txs,
+      tbill_usd: tbill,
     },
     verdict,
     netPerHour,
@@ -765,23 +887,65 @@ function scoreProtocol(
 }
 
 /** Held-out evidence for the fitted curve, computed at runtime from the snapshot. */
-function computeEvidence(snapshot: Snapshot, fit: CurveFit): Evidence {
+function computeEvidence(
+  snapshot: Snapshot,
+  fit: CurveFit,
+): { evidence: Evidence; ablation: AblationRow[] } {
   const comps = fitComps(snapshot);
   const miss = (pred: number, actual: number): number => Math.max(pred / actual, actual / pred);
 
-  // Leave-one-out: refit the curve without each comp, predict it.
+  // The test comp's own factors (growth, age) and its full-snapshot token
+  // odds, for the ablation's later terms. Odds do not use the curve, so
+  // leaving the comp in the odds' peer group leaks nothing about the fit.
+  const ages = snapshot.protocols
+    .filter((p) => p.listed_at !== null)
+    .map((p) => yearsBetween(p.listed_at!, snapshot.as_of));
+  const medianAge = median(ages) ?? 1;
+  const globalRate = snapshot.protocols.filter(recordsToken).length / snapshot.protocols.length;
+  const compOdds = new Map<string, number>();
+  for (const p of comps) compOdds.set(p.slug, tokenOdds(p, snapshot, medianAge, globalRate).odds);
+
+  // Leave-one-out: refit the curve without each comp, predict it; the
+  // ablation adds terms in order (curve, +category, +growth, +age, +odds).
   const looFitted: number[] = [];
   const looFlat: number[] = [];
+  const looCat: number[] = [];
+  const looGrowth: number[] = [];
+  const looAge: number[] = [];
+  const looFull: number[] = [];
   for (let i = 0; i < comps.length; i++) {
     const rest = comps.filter((_, j) => j !== i);
     const f = ols(
       rest.map((p) => Math.log(p.tvl_usd)),
       rest.map((p) => Math.log(p.mcap_usd!)),
     );
-    const pred = Math.exp(f.intercept + f.slope * Math.log(comps[i]!.tvl_usd));
-    looFitted.push(miss(pred, comps[i]!.mcap_usd!));
+    const test = comps[i]!;
+    const actual = test.mcap_usd!;
+    const predCurve = Math.exp(f.intercept + f.slope * Math.log(test.tvl_usd));
+    looFitted.push(miss(predCurve, actual));
     const flatMed = median(rest.map((p) => p.mcap_usd! / p.tvl_usd));
-    looFlat.push(miss((flatMed ?? 0) * comps[i]!.tvl_usd, comps[i]!.mcap_usd!));
+    looFlat.push(miss((flatMed ?? 0) * test.tvl_usd, actual));
+    const restFactors = categoryFactorsFrom(rest, {
+      slope: f.slope,
+      intercept: f.intercept,
+      r2: 0,
+      n_comps: rest.length,
+      multiple_at_100m: 0,
+    });
+    const catKey = test.category ?? '(none)';
+    const catMult = restFactors[catKey] !== undefined ? restFactors[catKey]!.factor : 1;
+    const predCat = predCurve * catMult;
+    looCat.push(miss(predCat, actual));
+    const growth =
+      test.change_7d === null ? 1 : 1 + (clamp(test.change_7d, -50, 100) / 100) * 0.5;
+    const predGrowth = predCat * growth;
+    looGrowth.push(miss(predGrowth, actual));
+    const age = ageYears(test, snapshot.as_of, medianAge);
+    const ageFactor = Math.min(1.5, 1 + 0.15 * Math.log(1 + Math.max(0, age)));
+    const predAge = predGrowth * ageFactor;
+    looAge.push(miss(predAge, actual));
+    const predFull = predAge * (compOdds.get(test.slug) ?? globalRate);
+    looFull.push(miss(predFull, actual));
   }
 
   // Walk-forward: fit on tokens listed before 2025-01-01, test on later ones.
@@ -800,11 +964,6 @@ function computeEvidence(snapshot: Snapshot, fit: CurveFit): Evidence {
   }
 
   // Brier score for the token odds over all 758 protocols, beside the base rate.
-  const ages = snapshot.protocols
-    .filter((p) => p.listed_at !== null)
-    .map((p) => yearsBetween(p.listed_at!, snapshot.as_of));
-  const medianAge = median(ages) ?? 1;
-  const globalRate = snapshot.protocols.filter(recordsToken).length / snapshot.protocols.length;
   let brier = 0;
   let brierBase = 0;
   for (const p of snapshot.protocols) {
@@ -816,15 +975,34 @@ function computeEvidence(snapshot: Snapshot, fit: CurveFit): Evidence {
   brier /= snapshot.protocols.length;
   brierBase /= snapshot.protocols.length;
 
+  // Term-by-term ablation: the median LOO miss as each term is added.
+  // The odds term is read honestly: it converts the if-launches value to an
+  // expected value, so it cannot improve a miss measured against market caps
+  // — its evidence is the Brier score, not this column.
+  const ablation: AblationRow[] = [
+    { label: 'Curve only', loo_miss: median(looFitted) ?? 0, note: 'size curve, fitted' },
+    { label: 'Curve + category', loo_miss: median(looCat) ?? 0, note: 'median ratio per category' },
+    { label: '+ growth (7d TVL)', loo_miss: median(looGrowth) ?? 0, note: 'clamped ±50/+100%' },
+    { label: '+ age (no-token years)', loo_miss: median(looAge) ?? 0, note: 'capped at ×1.5' },
+    {
+      label: 'Full model incl. odds',
+      loo_miss: median(looFull) ?? 0,
+      note: 'odds discount expected value; see Brier',
+    },
+  ];
+
   return {
-    loo_fitted: median(looFitted) ?? 0,
-    loo_flat: median(looFlat) ?? 0,
-    wf_fitted: wfFitted,
-    wf_flat: wfFlat,
-    wf_train: train.length,
-    wf_test: test.length,
-    brier_odds: brier,
-    brier_base: brierBase,
+    evidence: {
+      loo_fitted: median(looFitted) ?? 0,
+      loo_flat: median(looFlat) ?? 0,
+      wf_fitted: wfFitted,
+      wf_flat: wfFlat,
+      wf_train: train.length,
+      wf_test: test.length,
+      brier_odds: brier,
+      brier_base: brierBase,
+    },
+    ablation,
   };
 }
 
@@ -864,12 +1042,16 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     previous = s.impliedValue;
   }
 
+  // Bootstrap rank ranges: how sure is each rank? 200 refits of the curve.
+  const boot = bootstrapRanks(snapshot, scored);
+
   const board: BoardRow[] = scored.map((s, i) => {
     const spread = ratioSpread(s.category, snapshot, fit);
     const rangeLo = Math.max(1, Math.round(s.impliedValue * (spread.p25 / spread.median)));
     const rangeHi = Math.max(rangeLo, Math.round(s.impliedValue * (spread.p75 / spread.median)));
     const plan = farmPlan(s);
     const net = s.econ.farmer_drop_usd * s.odds - s.econ.fees_usd;
+    const bootRange = boot.get(s.slug) ?? { lo: i + 1, hi: i + 1 };
     return {
       slug: s.slug,
       name: s.name,
@@ -897,18 +1079,33 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       verdict: s.verdict,
       net_usd: net,
       net_per_hour_usd: s.netPerHour,
+      rank_lo: bootRange.lo,
+      rank_hi: bootRange.hi,
       econ: s.econ,
       peers: s.peers,
     };
   });
 
-  const evidence = computeEvidence(snapshot, fit);
+  const { evidence, ablation } = computeEvidence(snapshot, fit);
   const tokenRecorded = snapshot.protocols.filter(recordsToken).length;
   const accounting: Accounting = {
     ranked: board.length,
     token_recorded: tokenRecorded,
     left_out: snapshot.protocols.length - board.length - tokenRecorded,
     total: snapshot.protocols.length,
+  };
+
+  // The fitted factor range each term actually spans on this board.
+  const rangeOf = (values: number[]): [number, number] => [
+    Math.min(...values),
+    Math.max(...values),
+  ];
+  const factorValues = Object.values(factors).map((v) => v.factor);
+  const termRanges: TermRanges = {
+    category: factorValues.length > 0 ? rangeOf(factorValues) : [1, 1],
+    growth: rangeOf(scored.map((s) => s.growthFactor)),
+    age: rangeOf(scored.map((s) => s.ageFactor)),
+    odds: rangeOf(scored.map((s) => s.odds)),
   };
 
   const radar: RadarData = {
@@ -935,7 +1132,14 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       verdict_farm_per_hour_usd: VERDICT_FARM_PER_HOUR_USD,
       verdict_skip_net_usd: VERDICT_SKIP_NET_USD,
       odds_prior_weight: ODDS_PRIOR_WEIGHT,
+      tbill_rate: TBILL_RATE,
+      tbill_as_of: TBILL_AS_OF,
+      tbill_hold_days: TBILL_HOLD_DAYS,
+      bootstrap_draws: BOOTSTRAP_DRAWS,
+      bootstrap_seed: BOOTSTRAP_SEED,
     },
+    ablation,
+    term_ranges: termRanges,
   };
   return { board, radar };
 }
@@ -983,6 +1187,19 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
       return `row ${row.slug} has a non-finite farm net`;
     }
     if (!Array.isArray(row.peers) || row.peers.length !== 5) return `row ${row.slug} holds ${row.peers.length} peers, want 5`;
+    if (
+      !Number.isInteger(row.rank_lo) ||
+      !Number.isInteger(row.rank_hi) ||
+      row.rank_lo < 1 ||
+      row.rank_lo > row.rank ||
+      row.rank > row.rank_hi ||
+      row.rank_hi > board.length
+    ) {
+      return `row ${row.slug} has a rank range ${row.rank_lo}–${row.rank_hi} that does not bracket rank ${row.rank}`;
+    }
+    if (!Number.isFinite(row.econ.tbill_usd) || row.econ.tbill_usd < 0) {
+      return `row ${row.slug} has a bad T-bill figure`;
+    }
   }
   for (let r = 1; r <= board.length; r++) {
     if (!seenRanks.has(r)) return `rank ${r} is missing`;

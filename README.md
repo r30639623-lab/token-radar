@@ -10,8 +10,9 @@ A dashboard that finds the DeFi protocols whose token does not exist yet, ranks 
 
 - Reads the sealed DefiLlama snapshot (758 protocols, 2026-11-14).
 - Ranks **198 pre-token protocols** by **implied launch value** — all 40 watchlist protocols plus every other protocol in the snapshot that records no token. (The snapshot holds only 198 protocols that record no token at all: no gecko id, no symbol, no market cap. The earlier version used market cap alone and let 51 token-recording protocols onto the board; this version fixes that.)
-- Shows a sortable, filterable board with token odds, a value range and a FARM / MARGINAL / SKIP verdict per row, a detail view for every protocol (full value breakdown, farm economics, farm plan, and the five nearest priced peers), and a concrete 6-step farm plan per protocol with costs and times.
-- Prints its own held-out evidence on the board: the size curve's leave-one-out and walk-forward miss against a flat multiple, and the token odds' Brier score against the base rate.
+- Shows a sortable, filterable board with token odds, a value range, a bootstrap rank range and a FARM / MARGINAL / SKIP verdict per row, a detail view for every protocol (full value breakdown, a term-by-term validation table, farm economics with a T-bill benchmark, a deposit × drop-share matrix, farm plan, and the five nearest priced peers), and a concrete 6-step farm plan per protocol with costs and times.
+- Prints its own held-out evidence on the board: the size curve's leave-one-out and walk-forward miss against a flat multiple, the token odds' Brier score against the base rate, and the bootstrap rank ranges — the median row's rank spans 53 places across 200 refits, so the board says how sure each rank is instead of pretending ranks are certain.
+- Three sliders (deposit $1,000–$50,000, drop share 0.5–5%, gas 0.5×–3×) recompute the board's net and verdict live from the same formulas — the board's verdict is a scenario, not a fact. The detail view always shows the standard $10,000 / 2% scenario, and its matrix shows the same formula at $1,000 / $10,000 / $50,000 deposits and 1% / 2% / 5% drop shares.
 
 ## How the model works
 
@@ -39,6 +40,27 @@ A **$10,000 deposit**. The **drop pool is 2%** of the implied value; the **farmi
 - **MARGINAL** — everything between. 161 of 198 rows.
 
 The verdict ranks farming, not launch value: the biggest launches are the worst farms, because a $10,000 stake is a drop in their TVL. The top 5 by value (Steakhouse Financial, Sentora Curator, Veda, Gauntlet, USDD) all score SKIP on farming, with modelled nets of $11–$75.
+
+**Opportunity cost.** Every farm economics box carries a T-bill line: what the same $10,000 deposit earns in a US 3-month Treasury bill at **4.16% a year (Federal Reserve H.15, 19 Nov 2026)** over the **30-day minimum hold** the farm plans ask for — about **$34**. The verdict line reads e.g. "FARM — net $1,857 vs $34 in a T-bill for the same 30-day hold". The plans' hands-on time is under an hour, but the deposit is locked for the hold, so the comparison runs over the hold: a farm has to beat the risk-free rate, not just its fees.
+
+## How sure is a rank? (bootstrap, computed at runtime)
+
+The size curve is refitted **200 times** on resampled trading comps (bootstrap, fixed seed 20261114) and the board re-ranked each time. The Rank range column is the **P5–P95 rank** across those refits. The top rows are tight (rank 1 sits at 1–2, rank 2 at 2–3, rank 3 at 3–7), but the **median row's rank spans 53 places** — the middle of the board is a cloud, not a ladder, and the ranges say so instead of hiding it. Manifest Trade, the best farm on the board (rank 68), sits at 17–128.
+
+## Does each term earn its place? (ablation, computed at runtime)
+
+The detail view carries a term-by-term ablation: the leave-one-out median miss as each term is added to the curve, over the 128 traded comps.
+
+| Term, added in order | Leave-one-out miss | Verdict |
+|---|---|---|
+| Curve only | ×3.40 | kept — improves the miss |
+| Curve + category | ×3.77 | no help — kept for its reason, not for prediction |
+| + growth (7d TVL) | ×3.63 | helps a little |
+| + age (no-token years) | ×3.78 | no help — kept for its reason, not for prediction |
+| Full model incl. odds | ×3.67 | helps a little |
+| Flat median multiple (no model) | ×5.07 | baseline |
+
+Only the curve itself improves the held-out miss. The category factor, growth and age terms do not — they are kept for stated economic reasons (the category factor prices business-model differences, growth and age are launch-timing signals), and the table says so rather than hiding it. Token odds are judged by their Brier score (0.224 vs 0.248), not by this miss: they convert the if-launches value into an expected value, so they cannot improve a miss measured against market caps. Ranges each term spans on this board: category ×0.67–×2.44, growth ×0.75–×1.50, age ×1.00–×1.27, odds 27%–77%.
 
 ## How good is the model? (computed at runtime, shown on the board)
 

@@ -13,7 +13,7 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { TBILL_AS_OF, TBILL_RATE, boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -54,12 +54,17 @@ if (issue !== null) {
   const verdicts = { FARM: 0, MARGINAL: 0, SKIP: 0 };
   for (const r of board) verdicts[r.verdict]++;
   const top = board.slice(0, 5);
+  const widths = board.map((r) => r.rank_hi - r.rank_lo);
+  const medWidth = widths.slice().sort((a, b) => a - b)[Math.floor(widths.length / 2)];
   process.stdout.write(
     `token radar: fit ln(mcap) = ${f.intercept.toFixed(4)} + ${f.slope.toFixed(4)} ln(TVL), R2=${f.r2.toFixed(3)}, n=${f.n_comps} comps, multiple at $100M TVL=${f.multiple_at_100m.toFixed(3)}\n` +
       `token radar: evidence LOO fitted x${e.loo_fitted.toFixed(2)} vs flat x${e.loo_flat.toFixed(2)}; walk-forward fitted x${e.wf_fitted.toFixed(2)} vs flat x${e.wf_flat.toFixed(2)} (train ${e.wf_train}, test ${e.wf_test}); Brier odds ${e.brier_odds.toFixed(3)} vs base ${e.brier_base.toFixed(3)}\n` +
+      `token radar: ablation ${radar.ablation.map((a) => `${a.label} x${a.loo_miss.toFixed(2)}`).join(' | ')}\n` +
+      `token radar: bootstrap ${radar.assumptions.bootstrap_draws} draws: median rank-interval width ${medWidth} ranks; #1 ${board[0].slug} rank ${board[0].rank_lo}–${board[0].rank_hi}\n` +
+      `token radar: T-bill ${((radar.assumptions.tbill_rate ?? TBILL_RATE) * 100).toFixed(2)}%/yr as of ${radar.assumptions.tbill_as_of ?? TBILL_AS_OF}; #1 tbill $${board[0].econ.tbill_usd.toFixed(2)} vs net $${Math.round(board[0].net_usd).toLocaleString('en-US')}\n` +
       `token radar: accounting ranked ${radar.accounting.ranked} + token-recorded ${radar.accounting.token_recorded} + left out ${radar.accounting.left_out} = ${radar.accounting.total}\n` +
       `token radar: verdicts FARM ${verdicts.FARM}, MARGINAL ${verdicts.MARGINAL}, SKIP ${verdicts.SKIP}\n` +
-      top.map((r) => `token radar: #${r.rank} ${r.slug} $${r.implied_value_usd.toLocaleString('en-US')} odds ${(r.token_odds * 100).toFixed(0)}% ${r.verdict} net $${Math.round(r.net_usd).toLocaleString('en-US')}`).join('\n') + '\n',
+      top.map((r) => `token radar: #${r.rank} ${r.slug} $${r.implied_value_usd.toLocaleString('en-US')} odds ${(r.token_odds * 100).toFixed(0)}% ${r.verdict} net $${Math.round(r.net_usd).toLocaleString('en-US')} rank ${r.rank_lo}–${r.rank_hi}`).join('\n') + '\n',
   );
 }
 
