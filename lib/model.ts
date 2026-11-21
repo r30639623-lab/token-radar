@@ -1,4 +1,4 @@
-// lib/model.ts — the token-radar value model and farm-plan generator (v2).
+// lib/model.ts — the token-radar value model and farm-plan generator (v4).
 //
 // Everything here is calibrated from the sealed snapshot itself. No protocol
 // name, slug or chain is hardcoded anywhere: the model reads the snapshot's
@@ -13,34 +13,49 @@
 // ranks all 198: the 40 watchlist plus every other strict-clean protocol.)
 //
 // THE MODEL (implied launch value of a protocol that records no token)
-//   value = curve(TVL) x category factor x growth factor x age factor x token odds
+//   value = curve(TVL) x category factor x growth factor x token odds
 //   - curve(TVL): a log-log regression of market cap on TVL, fitted at
 //     RUNTIME from the token-trading protocols (mcap_usd > 0): the fitted
 //     line is ln(mcap) = intercept + slope x ln(TVL). Slope < 1 means big
 //     protocols carry lower multiples — a $2.75B protocol is not worth
 //     275x a $10M one. Protocols with mcap <= 0 (dead or unpriced tokens)
-//     cannot enter a log fit and are left out of it.
+//     cannot enter a log fit and are left out of it. The slope's standard
+//     error comes from the 200 bootstrap refits (slope ± s.e. on the page).
 //   - category factor: the MEDIAN of (actual mcap / curve-predicted mcap)
 //     over the token-trading protocols in the same category, shrunk toward
-//     1.0 by n/(n+8) and clamped to [0.3, 2.5]. A category counts only with
+//     1.0 by n/(n+64) and clamped to [0.3, 2.5]. A category counts only with
 //     at least MIN_SAMPLE = 3 trading comps; with fewer it falls back to
-//     1.0 (no adjustment). Shrinkage keeps one outlier category from
-//     pricing a whole group at fantasy levels.
+//     1.0 (no adjustment). The hard shrinkage is the keep-rule's verdict:
+//     the factor helps leave-one-out a little (x3.40 -> x3.37) and is flat
+//     walk-forward, so it is kept but shrunk hard.
 //   - growth factor: 1 + clamp(change_7d, -50, +100) / 100 x 0.5. Null
-//     change_7d = no adjustment.
-//   - age factor: 1 + 0.15 x ln(1 + years since listed_at), capped at 1.5.
-//     Null listed_at = the snapshot's median age. Years are measured to the
-//     snapshot's as_of date.
+//     change_7d = no adjustment. Kept: it lowers the leave-one-out miss
+//     (x3.37 -> x3.28) and is flat walk-forward.
+//   - age factor: TESTED, NOT KEPT in the value model. Age lowers the
+//     walk-forward miss (x3.08 -> x2.86) but raises the leave-one-out miss
+//     (x3.28 -> x3.77), so it fails the keep-rule and does not multiply
+//     the value. Age is kept where it earns its place: in the token odds
+//     (see below). The age in years is still shown per row, and the
+//     ablation table shows the failed test.
 //   - token odds: the peer-group rate of recording a token. Peers are the
-//     protocols in the same category, listed within a year of this one and
-//     within one decade of TVL; odds = (peers recording a token + 20 x
-//     global rate) / (peers + 20), shrunk toward the global rate (the share
-//     of all 758 protocols that record a token). A protocol's odds are the
-//     record of its peers, never a guess about the protocol itself.
-//   - ranges: P25-P75 of the peer ratios (mcap / curve-predicted) in the
-//     row's category, else the global spread, scaled onto the row's value.
-//     The curve explains about a fifth of the variation in market caps, so
-//     the ranges are honestly wide.
+//     protocols in the same category, listed within a year of this one;
+//     odds = (peers recording a token + 20 x global rate) / (peers + 20),
+//     shrunk toward the global rate (the share of all 758 protocols that
+//     record a token). A protocol's odds are the record of its peers, never
+//     a guess about the protocol itself. The TVL band the v2 odds used was
+//     tested and dropped: it shrinks the peer group without lowering the
+//     Brier score on either test (0.224 vs 0.220 leave-one-out, 0.313 vs
+//     0.310 walk-forward). Growth was tested in the odds and dropped too
+//     (0.229 / 0.314). Category and age are the only odds terms that lower
+//     the Brier score on BOTH tests.
+//   - ranges: the P25-P75 (and P10-P90) of the LEAVE-ONE-OUT residuals
+//     (actual mcap / held-out prediction) of the kept model, scaled onto
+//     the row's value. The v3 ranges used the in-sample spread of peer
+//     ratios and were too narrow: they covered only 42% of real caps
+//     leave-one-out and 39% walk-forward against 50% stated. The v4
+//     ranges cover 50% leave-one-out and 55% walk-forward (P10-P90: 80%
+//     and 74% against 80% stated) — the calibration panel on the page
+//     shows both the new and the old shares.
 //   - the result is rounded to whole dollars, clamped to [1, 1e14], and the
 //     board is forced strictly decreasing (a $1 nudge where two values tie),
 //     so rank always means something.
@@ -51,7 +66,8 @@
 //   farming pool (capped at the whole pool). Modelled drop = drop pool x
 //   share. Fees = one transaction per farm step that names gas, at the
 //   chain's typical gas (Ethereum $5, Solana $0.01, Bitcoin $3, every other
-//   chain $0.25). Hours = the steps' stated minutes, each counted once.
+//   chain $0.25), plus a $2 bridge fee per step that names one. Hours = the
+//   steps' stated minutes, each counted once.
 //   Net = modelled drop x token odds - fees. Verdict: FARM when net > $750
 //   and net/hour > $500 — the top decile of modelled nets under this
 //   scenario (the median row nets $322); SKIP when net < $100, a modelled
@@ -61,20 +77,24 @@
 //   assumed. Note the verdict ranks farming, not launch value: the biggest
 //   launches are the worst farms.
 //
-// THE EVIDENCE: the curve is tested held-out at runtime — leave-one-out
-// median miss and walk-forward median miss (fit on tokens listed before
-// 2025-01-01, tested on later ones), each beside the flat-median baseline,
-// plus a Brier score for the token odds beside the base-rate score. The
-// numbers are printed on the board; a fit that lost to the flat baseline
-// would show it there.
+// THE EVIDENCE: every term is tested held-out at runtime on TWO tests —
+// leave-one-out and walk-forward (fit on tokens listed before 2025-01-01,
+// tested on later ones) — each beside the flat-median baseline, plus a
+// Brier score for the token odds beside the base rate, per term. The
+// KEEP-RULE: a term stays in the value model only if it lowers the
+// held-out miss on both tests; it stays in the odds model only if it
+// lowers the Brier score on both tests. The numbers are printed on the
+// board; a fit that lost to the flat baseline would show it there.
 //
 // THE BOARD: every strict-clean pre-token protocol in the snapshot (198:
 // the 40 watchlist plus all 158 more). "Rule-clean" re-derives the
 // snapshot's own watchlist rule, with the strict token test.
 //
-// THE FARM PLANS: 6 concrete steps per protocol, generated from the
-// protocol's own category and chains. Every step names a dollar amount or a
-// gas cost and a time; nothing is a slogan.
+// THE FARM PLANS: 10 concrete steps per protocol, generated from the
+// protocol's own category and chains: 6 category steps plus 4 closing
+// steps (verify, record, watch, cadence) that apply to every farm. Every
+// step carries its cost and its hands-on minutes in the text ("COST $5.00
+// gas · TIME 10 min hands-on"); nothing is a slogan.
 
 export interface Protocol {
   slug: string;
@@ -146,6 +166,9 @@ export interface BoardRow {
   odds_peers_with_token: number;
   range_lo_usd: number;
   range_hi_usd: number;
+  /** Wider range (P10–P90 of the leave-one-out residuals), same construction. */
+  range_p10_usd: number;
+  range_p90_usd: number;
   verdict: Verdict;
   net_usd: number;
   net_per_hour_usd: number;
@@ -162,6 +185,9 @@ export interface CurveFit {
   r2: number;
   n_comps: number;
   multiple_at_100m: number;
+  /** Standard error of the slope (and of the $100M multiple) across the 200 bootstrap refits. */
+  slope_se: number;
+  multiple_se: number;
 }
 
 export interface Evidence {
@@ -171,15 +197,53 @@ export interface Evidence {
   wf_flat: number;
   wf_train: number;
   wf_test: number;
+  /** How the walk-forward split is made: fitted on tokens listed before the cut, tested on later ones. */
+  wf_split: string;
   brier_odds: number;
   brier_base: number;
 }
 
-/** One row of the term-by-term ablation: the LOO median miss of the model with terms added in order. */
+/** One row of the term-by-term ablation: the median miss of the model with terms added in order, on both tests. */
 export interface AblationRow {
   label: string;
   loo_miss: number;
+  wf_miss: number;
+  /** 'kept' | 'dropped' | 'expected value': the keep-rule's verdict for this term. */
+  verdict: string;
   note: string;
+}
+
+/** One row of the odds ablation: the Brier score of the peer-group odds as terms are added, on both tests. */
+export interface OddsAblationRow {
+  label: string;
+  loo_brier: number;
+  wf_brier: number;
+  /** 'kept' | 'dropped': the keep-rule's verdict for this odds term. */
+  verdict: string;
+  note: string;
+}
+
+/** Is the printed range honest? The share of real market caps that fall inside the predicted ranges, leave-one-out and walk-forward, for the new residual-based construction and the old peer-spread one. */
+export interface Calibration {
+  /** Share inside P25–P75 / P10–P90 / within ×3 of the point estimate, leave-one-out (new construction). */
+  loo_p2575: number;
+  loo_p1090: number;
+  loo_x3: number;
+  /** Same, walk-forward (fitted on earlier listings, tested on later ones). */
+  wf_p2575: number;
+  wf_p1090: number;
+  wf_x3: number;
+  /** The old peer-spread construction's shares, for the before/after. */
+  old_loo_p2575: number;
+  old_loo_p1090: number;
+  old_wf_p2575: number;
+  old_wf_p1090: number;
+  /** The leave-one-out residual quantiles the ranges are built from (actual / held-out prediction). */
+  resid_p10: number;
+  resid_p25: number;
+  resid_median: number;
+  resid_p75: number;
+  resid_p90: number;
 }
 
 /** The fitted factor ranges each term actually spans on this board. */
@@ -230,13 +294,19 @@ export interface RadarData {
   evidence: Evidence;
   accounting: Accounting;
   assumptions: Assumptions;
-  /** Term-by-term ablation (LOO median miss, terms added in order) and the factor range each term spans. */
+  /** Term-by-term ablation (median miss on both tests, terms added in order) and the factor range each term spans. */
   ablation: AblationRow[];
+  /** Term-by-term odds ablation (Brier score on both tests) and the range-calibration panel. */
+  odds_ablation: OddsAblationRow[];
+  calibration: Calibration;
   term_ranges: TermRanges;
 }
 
 /** A category factor is trusted only with this many trading comps. */
 export const MIN_SAMPLE = 3;
+
+/** Category factors shrink toward 1.0 by n/(n+64): hard shrinkage, because the factor only helps leave-one-out a little and is flat walk-forward. */
+export const CATEGORY_SHRINK = 64;
 
 /** The farm scenario, stated on the page and in the README. */
 export const DEPOSIT_USD = 10_000;
@@ -317,9 +387,10 @@ export function isCleanPreToken(p: Protocol): boolean {
   return true;
 }
 
-/** A farm step's stated minutes (its number before "min") and whether it names gas (one transaction). Each step counts once, as stated. */
+/** A farm step's stated minutes (its TIME marker, else its number before "min") and whether it names gas (one transaction). Each step counts once, as stated. */
 export function stepEffort(step: string): { minutes: number; txs: number } {
-  const m = step.match(/(\d+)\s*min/);
+  const marked = step.match(/TIME (\d+)\s*min/);
+  const m = marked ?? step.match(/(\d+)\s*min/);
   return { minutes: m !== null ? Number(m[1]) : 10, txs: /gas/i.test(step) ? 1 : 0 };
 }
 
@@ -538,25 +609,55 @@ const TEMPLATES: Record<string, Step[]> = {
   Insurance: INSURANCE_STEPS,
 };
 
-/** Six concrete steps for a protocol, from its own category and chains. */
+/** Six concrete steps for a protocol, from its own category and chains — plus the four closing steps every farm needs. Every step carries its cost and its hands-on minutes ("COST $5.00 gas · TIME 10 min hands-on"). */
 export function farmSteps(p: Protocol): string[] {
   const chain = p.chains[0] ?? 'Ethereum';
   const gas = gasFor(chain);
   const steps = TEMPLATES[p.category ?? ''] ?? GENERIC_STEPS;
-  return steps.map((s) => s(p.name, chain, gas));
+  const priced = steps.map((s) => withCostTime(s(p.name, chain, gas), chain));
+  const k = `$${gasPerTx(chain).toFixed(2)}`;
+  return [...priced, ...CLOSING_STEPS.map((s) => s(p.name, chain, k))];
 }
 
-/** The steps plus their effort: total stated minutes and gas-naming transactions. */
-export function farmPlan(p: Protocol): { steps: string[]; minutes: number; txs: number } {
+/** Rewrite a template step so its cost and hands-on time are explicit: the trailing "(… gas, 10 min)" becomes "COST $5.00 gas · TIME 10 min hands-on". The gas word stays in the text, so the step still counts as one gas transaction; a step that names a bridge fee carries the $2 fee in its cost. */
+function withCostTime(step: string, chain: string): string {
+  const paren = step.match(/\(([^)]*)\)\.?\s*$/);
+  let core = step;
+  let timePhrase = '10 min';
+  if (paren !== null) {
+    core = step.slice(0, paren.index).trimEnd();
+    const tm = paren[1]!.match(/(\d+\s*min[^,)]*)/);
+    if (tm !== null) timePhrase = tm[1]!.trim();
+  }
+  const namesGas = /gas/i.test(step);
+  const bridgeFee = /bridge fee/i.test(step) ? 2 : 0;
+  const cost = (namesGas ? gasPerTx(chain) : 0) + bridgeFee;
+  return `${core}. COST $${cost.toFixed(2)}${namesGas ? ' gas' : ''} · TIME ${timePhrase} hands-on.`;
+}
+
+/** The four closing steps: verify, record, watch, cadence. They apply to every farm, whatever the category. */
+const CLOSING_STEPS: Step[] = [
+  'Verify {N}\u2019s contract addresses against its official docs and the DefiLlama page before your next deposit — never sign an approval from a link sent in a DM. COST $0.00 · TIME 5 min hands-on.',
+  'Keep a ledger from the first transaction: date, tx hash, amount and dollar value of every deposit, claim and withdrawal — a drop may ask you to prove your history. COST $0.00 · TIME 5 min hands-on.',
+  'Set an exit rule now: withdraw if {N}\u2019s TVL falls 20% in a week or withdrawals pause; check TVL weekly. COST $0.00 · TIME 5 min a week hands-on.',
+  'Touch the position once a week for 12 weeks (top-up, claim, or harvest — one gas transaction a week) rather than one deposit: steady use reads as a real user. COST {G} gas · TIME 5 min a week hands-on.',
+].map((template) => (name: string, chain: string, gas: string) =>
+  template.replaceAll('{N}', name).replaceAll('{C}', chain).replaceAll('{G}', gas),
+);
+
+/** The steps plus their effort: total stated minutes, gas-naming transactions, and bridge fees ($2 per step that names one). */
+export function farmPlan(p: Protocol): { steps: string[]; minutes: number; txs: number; extraFeesUsd: number } {
   const steps = farmSteps(p);
   let minutes = 0;
   let txs = 0;
+  let extraFeesUsd = 0;
   for (const s of steps) {
     const e = stepEffort(s);
     minutes += e.minutes;
     txs += e.txs;
+    if (/bridge fee/i.test(s)) extraFeesUsd += 2;
   }
-  return { steps, minutes, txs };
+  return { steps, minutes, txs, extraFeesUsd };
 }
 
 /** Typical gas per transaction on a chain, in dollars. */
@@ -620,6 +721,9 @@ export function fitCurve(snapshot: Snapshot): CurveFit {
     r2: f.r2,
     n_comps: comps.length,
     multiple_at_100m: Math.exp(f.intercept + f.slope * Math.log(100_000_000)) / 100_000_000,
+    // Filled in by buildRadar from the bootstrap refits (no refit here).
+    slope_se: 0,
+    multiple_se: 0,
   };
 }
 
@@ -642,7 +746,7 @@ function categoryFactorsFrom(comps: Protocol[], fit: CurveFit): Record<string, {
     if (values.length < MIN_SAMPLE) continue;
     const med = median(values);
     if (med === null) continue;
-    const w = values.length / (values.length + 8);
+    const w = values.length / (values.length + CATEGORY_SHRINK);
     const factor = clamp(1 + (med - 1) * w, 0.3, 2.5);
     out[key] = { factor, comps: values.length };
   }
@@ -670,12 +774,13 @@ function mulberry32(seed: number): () => number {
  * Bootstrap rank ranges: resample the traded comps with replacement, refit
  * the curve and the category factors each draw, re-rank the whole board, and
  * take the P5–P95 rank per row. A wide interval means the rank is fragile;
- * a narrow one means the curve is sure of it.
+ * a narrow one means the curve is sure of it. The draws also give the
+ * standard error of the slope and of the $100M multiple.
  */
 function bootstrapRanks(
   snapshot: Snapshot,
   scored: Scored[],
-): Map<string, { lo: number; hi: number }> {
+): { ranges: Map<string, { lo: number; hi: number }>; slopeSe: number; multipleSe: number } {
   const comps = fitComps(snapshot);
   const n = comps.length;
   const xs = comps.map((p) => Math.log(p.tvl_usd));
@@ -683,6 +788,8 @@ function bootstrapRanks(
   const rand = mulberry32(BOOTSTRAP_SEED);
   const ranks = new Map<string, number[]>();
   for (const s of scored) ranks.set(s.slug, []);
+  const slopes: number[] = [];
+  const multiples: number[] = [];
   for (let d = 0; d < BOOTSTRAP_DRAWS; d++) {
     const sx: number[] = [];
     const sy: number[] = [];
@@ -694,12 +801,16 @@ function bootstrapRanks(
       sampled.push(comps[j]!);
     }
     const f = ols(sx, sy);
+    slopes.push(f.slope);
+    multiples.push(Math.exp(f.intercept + f.slope * Math.log(100_000_000)) / 100_000_000);
     const drawFit: CurveFit = {
       slope: f.slope,
       intercept: f.intercept,
       r2: f.r2,
       n_comps: n,
       multiple_at_100m: Math.exp(f.intercept + f.slope * Math.log(100_000_000)) / 100_000_000,
+      slope_se: 0,
+      multiple_se: 0,
     };
     const factors = categoryFactorsFrom(sampled, drawFit);
     const vals = scored.map((s) => {
@@ -707,7 +818,7 @@ function bootstrapRanks(
       const mult = factors[key] !== undefined ? factors[key]!.factor : 1;
       return {
         slug: s.slug,
-        v: curveValue(drawFit, s.tvl_usd) * mult * s.growthFactor * s.ageFactor * s.odds,
+        v: curveValue(drawFit, s.tvl_usd) * mult * s.growthFactor * s.odds,
         tvl: s.tvl_usd,
       };
     });
@@ -721,7 +832,11 @@ function bootstrapRanks(
       hi: clamp(Math.round(percentile(rs, 0.95)), 1, scored.length),
     });
   }
-  return out;
+  const sd = (v: number[]): number => {
+    const m = v.reduce((s, x) => s + x, 0) / v.length;
+    return Math.sqrt(v.reduce((s, x) => s + (x - m) * (x - m), 0) / (v.length - 1));
+  };
+  return { ranges: out, slopeSe: sd(slopes), multipleSe: sd(multiples) };
 }
 
 function ageYears(p: Protocol, asOf: string, medianAge: number): number {
@@ -729,22 +844,31 @@ function ageYears(p: Protocol, asOf: string, medianAge: number): number {
   return yearsBetween(p.listed_at, asOf);
 }
 
-/** P(token) from the snapshot's own record: the peer-group rate. Peers share the category, were listed within a year, and sit within one decade of TVL; the rate is shrunk toward the global token rate. */
+/** P(token) from the snapshot's own record: the peer-group rate. Peers share the category and were listed within a year of this one; the rate is shrunk toward the global token rate. The TVL band the v2 odds used was tested and dropped: it shrinks the peer group without lowering the Brier score on either test (see the odds ablation). */
 export function tokenOdds(
   p: Protocol,
   snapshot: Snapshot,
   medianAge: number,
   globalRate: number,
 ): { odds: number; peers: number; peersWithToken: number } {
-  const age = ageYears(p, snapshot.as_of, medianAge);
-  const logTvl = Math.log10(Math.max(1, p.tvl_usd));
+  return tokenOddsPool(p, snapshot.protocols, snapshot.as_of, medianAge, globalRate);
+}
+
+/** The peer-group odds over any pool of protocols (the full snapshot, or the walk-forward training set). */
+function tokenOddsPool(
+  p: Protocol,
+  pool: Protocol[],
+  asOf: string,
+  medianAge: number,
+  globalRate: number,
+): { odds: number; peers: number; peersWithToken: number } {
+  const age = ageYears(p, asOf, medianAge);
   let peers = 0;
   let withToken = 0;
-  for (const q of snapshot.protocols) {
+  for (const q of pool) {
     if (q.slug === p.slug) continue;
     if (q.category !== p.category) continue;
-    if (Math.abs(ageYears(q, snapshot.as_of, medianAge) - age) > 1) continue;
-    if (Math.abs(Math.log10(Math.max(1, q.tvl_usd)) - logTvl) > 1) continue;
+    if (Math.abs(ageYears(q, asOf, medianAge) - age) > 1) continue;
     peers++;
     if (recordsToken(q)) withToken++;
   }
@@ -752,21 +876,28 @@ export function tokenOdds(
   return { odds, peers, peersWithToken: withToken };
 }
 
-/** P25-P75 of the peer ratios (mcap / curve-predicted) in the row's category, else the global spread. */
+/** Quantiles of the peer ratios (mcap / curve-predicted) in the row's category over any comp list, else the global spread. Only used to measure the OLD range construction's calibration. */
 function ratioSpread(
   category: string | null,
-  snapshot: Snapshot,
+  comps: Protocol[],
   fit: CurveFit,
-): { p25: number; median: number; p75: number } {
+): { p10: number; p25: number; median: number; p75: number; p90: number } {
   const ratios: number[] = [];
   const global: number[] = [];
-  for (const p of fitComps(snapshot)) {
-    const r = p.mcap_usd! / curveValue(fit, p.tvl_usd);
+  for (const p of comps) {
+    if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
+    const r = p.mcap_usd / curveValue(fit, p.tvl_usd);
     global.push(r);
     if (p.category === category) ratios.push(r);
   }
   const use = ratios.length >= MIN_SAMPLE ? ratios : global;
-  return { p25: percentile(use, 0.25), median: median(use) ?? 1, p75: percentile(use, 0.75) };
+  return {
+    p10: percentile(use, 0.1),
+    p25: percentile(use, 0.25),
+    median: median(use) ?? 1,
+    p75: percentile(use, 0.75),
+    p90: percentile(use, 0.9),
+  };
 }
 
 /** The five nearest token-trading peers in the same category by TVL distance, topped up with the nearest overall. */
@@ -833,14 +964,17 @@ function scoreProtocol(
     p.change_7d === null ? 1 : 1 + (clamp(p.change_7d, -50, 100) / 100) * 0.5;
   const age = ageYears(p, snapshot.as_of, medianAge);
   const ageFactor = Math.min(1.5, 1 + 0.15 * Math.log(1 + Math.max(0, age)));
-  const ifLaunches = curveValue(fit, p.tvl_usd) * multiple * growthFactor * ageFactor;
+  // Age is TESTED, NOT KEPT in the value model (it fails the keep-rule's
+  // leave-one-out test); it earns its place in the token odds instead.
+  // The factor is still computed and shown, so the reader sees the test.
+  const ifLaunches = curveValue(fit, p.tvl_usd) * multiple * growthFactor;
   const { odds, peers, peersWithToken } = tokenOdds(p, snapshot, medianAge, globalRate);
   const impliedValue = Math.max(1, Math.min(1e14, Math.round(ifLaunches * odds)));
 
   const plan = farmPlan(p);
   const chain = p.chains[0] ?? 'Ethereum';
   const gas = gasPerTx(chain);
-  const fees = plan.txs * gas;
+  const fees = plan.txs * gas + plan.extraFeesUsd;
   const hours = Math.max(0.1, plan.minutes / 60);
   const dropPool = DROP_POOL_PCT * impliedValue;
   const share = Math.min(1, DEPOSIT_USD / Math.max(1, FARMING_POOL_PCT * p.tvl_usd));
@@ -890,7 +1024,7 @@ function scoreProtocol(
 function computeEvidence(
   snapshot: Snapshot,
   fit: CurveFit,
-): { evidence: Evidence; ablation: AblationRow[] } {
+): { evidence: Evidence; ablation: AblationRow[]; oddsAblation: OddsAblationRow[]; calibration: Calibration } {
   const comps = fitComps(snapshot);
   const miss = (pred: number, actual: number): number => Math.max(pred / actual, actual / pred);
 
@@ -913,6 +1047,12 @@ function computeEvidence(
   const looGrowth: number[] = [];
   const looAge: number[] = [];
   const looFull: number[] = [];
+  // The kept model's leave-one-out residuals (actual / held-out prediction):
+  // the ranges are built from these. And the OLD range construction's
+  // coverage, for the before/after in the calibration panel.
+  const looResid: number[] = [];
+  let oldLoo2575 = 0;
+  let oldLoo1090 = 0;
   for (let i = 0; i < comps.length; i++) {
     const rest = comps.filter((_, j) => j !== i);
     const f = ols(
@@ -946,50 +1086,207 @@ function computeEvidence(
     looAge.push(miss(predAge, actual));
     const predFull = predAge * (compOdds.get(test.slug) ?? globalRate);
     looFull.push(miss(predFull, actual));
+    // The kept model's residual: actual over the held-out prediction.
+    looResid.push(actual / predGrowth);
+    // The OLD range construction's coverage: the in-sample spread of peer
+    // ratios, scaled onto the same held-out prediction.
+    const spread = ratioSpread(test.category, rest, {
+      slope: f.slope,
+      intercept: f.intercept,
+      r2: 0,
+      n_comps: rest.length,
+      multiple_at_100m: 0,
+      slope_se: 0,
+      multiple_se: 0,
+    });
+    const oldLo = predGrowth * (spread.p25 / spread.median);
+    const oldHi = predGrowth * (spread.p75 / spread.median);
+    if (actual >= oldLo && actual <= oldHi) oldLoo2575++;
+    const oldLo10 = predGrowth * (spread.p10 / spread.median);
+    const oldHi10 = predGrowth * (spread.p90 / spread.median);
+    if (actual >= oldLo10 && actual <= oldHi10) oldLoo1090++;
   }
 
+  // The kept model's leave-one-out residual quantiles: the ranges are built
+  // from these, so the printed range is calibrated by construction.
+  const residQ25 = percentile(looResid, 0.25);
+  const residQMed = median(looResid) ?? 1;
+  const residQ75 = percentile(looResid, 0.75);
+  const residQ10 = percentile(looResid, 0.1);
+  const residQ90 = percentile(looResid, 0.9);
+
   // Walk-forward: fit on tokens listed before 2025-01-01, test on later ones.
+  // Every term is scored on this split too, with the training set's own
+  // factors and odds — the full model uses train-only peers for its odds.
   const train = comps.filter((p) => p.listed_at !== null && p.listed_at < '2025-01-01');
   const test = comps.filter((p) => p.listed_at !== null && p.listed_at >= '2025-01-01');
+  const trainProtos = snapshot.protocols.filter((p) => p.listed_at !== null && p.listed_at < '2025-01-01');
+  const testProtos = snapshot.protocols.filter((p) => p.listed_at !== null && p.listed_at >= '2025-01-01');
+  const trainRate = trainProtos.filter(recordsToken).length / Math.max(1, trainProtos.length);
   let wfFitted = 0;
   let wfFlat = 0;
+  let wfCat = 0;
+  let wfGrowth = 0;
+  let wfAge = 0;
+  let wfFull = 0;
+  let wfCal2575 = 0;
+  let wfCal1090 = 0;
+  let wfCalX3 = 0;
+  let wfOld2575 = 0;
+  let wfOld1090 = 0;
   if (train.length >= 5 && test.length >= 1) {
     const f = ols(
       train.map((p) => Math.log(p.tvl_usd)),
       train.map((p) => Math.log(p.mcap_usd!)),
     );
     const flatMed = median(train.map((p) => p.mcap_usd! / p.tvl_usd)) ?? 0;
-    wfFitted = median(test.map((p) => miss(Math.exp(f.intercept + f.slope * Math.log(p.tvl_usd)), p.mcap_usd!))) ?? 0;
+    const trainFactors = categoryFactorsFrom(train, {
+      slope: f.slope,
+      intercept: f.intercept,
+      r2: 0,
+      n_comps: train.length,
+      multiple_at_100m: 0,
+      slope_se: 0,
+      multiple_se: 0,
+    });
+    const curvePred = (p: Protocol): number => Math.exp(f.intercept + f.slope * Math.log(p.tvl_usd));
+    const catMult = (p: Protocol): number => {
+      const e = trainFactors[p.category ?? '(none)'];
+      return e !== undefined ? e.factor : 1;
+    };
+    const growthOf = (p: Protocol): number =>
+      p.change_7d === null ? 1 : 1 + (clamp(p.change_7d, -50, 100) / 100) * 0.5;
+    const ageOf = (p: Protocol): number => {
+      const a = ageYears(p, snapshot.as_of, medianAge);
+      return Math.min(1.5, 1 + 0.15 * Math.log(1 + Math.max(0, a)));
+    };
+    const wfMiss = (pred: (p: Protocol) => number): number =>
+      median(test.map((p) => miss(pred(p), p.mcap_usd!))) ?? 0;
+    wfFitted = wfMiss(curvePred);
     wfFlat = median(test.map((p) => miss(flatMed * p.tvl_usd, p.mcap_usd!))) ?? 0;
+    wfCat = wfMiss((p) => curvePred(p) * catMult(p));
+    wfGrowth = wfMiss((p) => curvePred(p) * catMult(p) * growthOf(p));
+    wfAge = wfMiss((p) => curvePred(p) * catMult(p) * growthOf(p) * ageOf(p));
+    wfFull = wfMiss(
+      (p) =>
+        curvePred(p) * catMult(p) * growthOf(p) * ageOf(p) *
+        tokenOddsPool(p, trainProtos, snapshot.as_of, medianAge, trainRate).odds,
+    );
+    // Walk-forward calibration: the LOO residual quantiles applied to the
+    // kept-model prediction on later listings, beside the old construction.
+    for (const p of test) {
+      const pred = curvePred(p) * catMult(p) * growthOf(p);
+      const act = p.mcap_usd!;
+      if (act >= pred * (residQ25 / residQMed) && act <= pred * (residQ75 / residQMed)) wfCal2575++;
+      if (act >= pred * (residQ10 / residQMed) && act <= pred * (residQ90 / residQMed)) wfCal1090++;
+      if (act >= pred / 3 && act <= pred * 3) wfCalX3++;
+      const sp = ratioSpread(p.category, train, {
+        slope: f.slope,
+        intercept: f.intercept,
+        r2: 0,
+        n_comps: train.length,
+        multiple_at_100m: 0,
+        slope_se: 0,
+        multiple_se: 0,
+      });
+      if (act >= pred * (sp.p25 / sp.median) && act <= pred * (sp.p75 / sp.median)) wfOld2575++;
+      if (act >= pred * (sp.p10 / sp.median) && act <= pred * (sp.p90 / sp.median)) wfOld1090++;
+    }
   }
 
-  // Brier score for the token odds over all 758 protocols, beside the base rate.
-  let brier = 0;
-  let brierBase = 0;
-  for (const p of snapshot.protocols) {
-    const o = tokenOdds(p, snapshot, medianAge, globalRate).odds;
-    const t = recordsToken(p) ? 1 : 0;
-    brier += (o - t) * (o - t);
-    brierBase += (globalRate - t) * (globalRate - t);
-  }
-  brier /= snapshot.protocols.length;
-  brierBase /= snapshot.protocols.length;
+  // Odds, term by term: each variant is a peer definition. Leave-one-out
+  // is free — the peer loop skips the protocol itself. Walk-forward uses
+  // only earlier-listed protocols as peers, with the training set's rate.
+  const oddsWith = (p: Protocol, pool: Protocol[], rate: number, terms: string[]): number => {
+    const age = ageYears(p, snapshot.as_of, medianAge);
+    const logTvl = Math.log10(Math.max(1, p.tvl_usd));
+    let peers = 0;
+    let withToken = 0;
+    for (const q of pool) {
+      if (q.slug === p.slug) continue;
+      if (terms.includes('cat') && q.category !== p.category) continue;
+      if (terms.includes('age') && Math.abs(ageYears(q, snapshot.as_of, medianAge) - age) > 1) continue;
+      if (terms.includes('size') && Math.abs(Math.log10(Math.max(1, q.tvl_usd)) - logTvl) > 1) continue;
+      if (terms.includes('growth') && p.change_7d !== null && q.change_7d !== null && Math.sign(q.change_7d) !== Math.sign(p.change_7d)) continue;
+      peers++;
+      if (recordsToken(q)) withToken++;
+    }
+    return (withToken + ODDS_PRIOR_WEIGHT * rate) / (peers + ODDS_PRIOR_WEIGHT);
+  };
+  const brierOf = (testPool: Protocol[], rate: number, terms: string[]): { loo: number; wf: number } => {
+    let loo = 0;
+    for (const p of snapshot.protocols) {
+      const o = terms.length === 0 ? rate : oddsWith(p, snapshot.protocols, rate, terms);
+      const t = recordsToken(p) ? 1 : 0;
+      loo += (o - t) * (o - t);
+    }
+    let wf = 0;
+    for (const p of testPool) {
+      const o = terms.length === 0 ? trainRate : oddsWith(p, trainProtos, trainRate, terms);
+      const t = recordsToken(p) ? 1 : 0;
+      wf += (o - t) * (o - t);
+    }
+    return { loo: loo / snapshot.protocols.length, wf: wf / Math.max(1, testPool.length) };
+  };
+  const oddsVariants: { label: string; terms: string[]; note: string }[] = [
+    { label: 'Base rate', terms: [], note: 'global token rate' },
+    { label: '+ category', terms: ['cat'], note: 'peers in the same category' },
+    { label: '+ age', terms: ['cat', 'age'], note: 'listed within a year — the kept odds' },
+    { label: '+ size (TVL band)', terms: ['cat', 'age', 'size'], note: 'within one decade of TVL' },
+    { label: '+ growth (7d sign)', terms: ['cat', 'age', 'size', 'growth'], note: 'same sign of 7d change' },
+  ];
+  const oddsBriers = oddsVariants.map((v) => brierOf(testProtos, globalRate, v.terms));
+  const oddsAblation: OddsAblationRow[] = oddsVariants.map((v, i) => {
+    const b = oddsBriers[i]!;
+    const prev = i === 0 ? null : oddsBriers[i - 1]!;
+    const verdict = i === 0 ? 'baseline' : b.loo < prev.loo && b.wf < prev.wf ? 'kept' : 'dropped';
+    return { label: v.label, loo_brier: b.loo, wf_brier: b.wf, verdict, note: v.note };
+  });
+  // The kept odds are category + age (index 2); the base rate is index 0.
+  const brier = oddsBriers[2]!.loo;
+  const brierBase = oddsBriers[0]!.loo;
 
-  // Term-by-term ablation: the median LOO miss as each term is added.
-  // The odds term is read honestly: it converts the if-launches value to an
-  // expected value, so it cannot improve a miss measured against market caps
-  // — its evidence is the Brier score, not this column.
+  // Term-by-term ablation: the median miss as each term is added, on both
+  // tests. The odds term is read honestly: it converts the if-launches
+  // value to an expected value, so it cannot improve a miss measured
+  // against market caps — its evidence is the Brier score, not this column.
   const ablation: AblationRow[] = [
-    { label: 'Curve only', loo_miss: median(looFitted) ?? 0, note: 'size curve, fitted' },
-    { label: 'Curve + category', loo_miss: median(looCat) ?? 0, note: 'median ratio per category' },
-    { label: '+ growth (7d TVL)', loo_miss: median(looGrowth) ?? 0, note: 'clamped ±50/+100%' },
-    { label: '+ age (no-token years)', loo_miss: median(looAge) ?? 0, note: 'capped at ×1.5' },
+    { label: 'Curve only', loo_miss: median(looFitted) ?? 0, wf_miss: wfFitted, verdict: 'kept', note: 'size curve, fitted' },
+    { label: 'Curve + category', loo_miss: median(looCat) ?? 0, wf_miss: wfCat, verdict: 'kept', note: 'median ratio per category, shrunk n/(n+64)' },
+    { label: '+ growth (7d TVL)', loo_miss: median(looGrowth) ?? 0, wf_miss: wfGrowth, verdict: 'kept', note: 'clamped ±50/+100%' },
+    { label: '+ age (no-token years)', loo_miss: median(looAge) ?? 0, wf_miss: wfAge, verdict: 'dropped', note: 'fails leave-one-out; kept in token odds instead' },
     {
       label: 'Full model incl. odds',
       loo_miss: median(looFull) ?? 0,
+      wf_miss: wfFull,
+      verdict: 'expected value',
       note: 'odds discount expected value; see Brier',
     },
   ];
+
+  // The calibration panel: the share of real caps inside the printed
+  // ranges, for the new residual-based construction and the old peer-spread
+  // one. Leave-one-out coverage is computed from the residuals themselves,
+  // so the new P25–P75 covers 50% by construction; walk-forward is the
+  // real test of the range.
+  const inRange = (r: number, lo: number, hi: number): boolean => r >= lo && r <= hi;
+  const calibration: Calibration = {
+    loo_p2575: looResid.filter((r) => inRange(r, residQ25, residQ75)).length / looResid.length,
+    loo_p1090: looResid.filter((r) => inRange(r, residQ10, residQ90)).length / looResid.length,
+    loo_x3: looResid.filter((r) => r >= 1 / 3 && r <= 3).length / looResid.length,
+    wf_p2575: test.length > 0 ? wfCal2575 / test.length : 0,
+    wf_p1090: test.length > 0 ? wfCal1090 / test.length : 0,
+    wf_x3: test.length > 0 ? wfCalX3 / test.length : 0,
+    old_loo_p2575: oldLoo2575 / comps.length,
+    old_loo_p1090: oldLoo1090 / comps.length,
+    old_wf_p2575: test.length > 0 ? wfOld2575 / test.length : 0,
+    old_wf_p1090: test.length > 0 ? wfOld1090 / test.length : 0,
+    resid_p10: residQ10,
+    resid_p25: residQ25,
+    resid_median: residQMed,
+    resid_p75: residQ75,
+    resid_p90: residQ90,
+  };
 
   return {
     evidence: {
@@ -999,10 +1296,13 @@ function computeEvidence(
       wf_flat: wfFlat,
       wf_train: train.length,
       wf_test: test.length,
+      wf_split: 'listed before 2025-01-01, tested on 2025-01-01 or later',
       brier_odds: brier,
       brier_base: brierBase,
     },
     ablation,
+    oddsAblation,
+    calibration,
   };
 }
 
@@ -1042,16 +1342,23 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     previous = s.impliedValue;
   }
 
+  // Held-out evidence first: the board's ranges are built from the
+  // leave-one-out residual quantiles, so they need the evidence.
+  const { evidence, ablation, oddsAblation, calibration } = computeEvidence(snapshot, fit);
+
   // Bootstrap rank ranges: how sure is each rank? 200 refits of the curve.
   const boot = bootstrapRanks(snapshot, scored);
+  fit.slope_se = boot.slopeSe;
+  fit.multiple_se = boot.multipleSe;
 
   const board: BoardRow[] = scored.map((s, i) => {
-    const spread = ratioSpread(s.category, snapshot, fit);
-    const rangeLo = Math.max(1, Math.round(s.impliedValue * (spread.p25 / spread.median)));
-    const rangeHi = Math.max(rangeLo, Math.round(s.impliedValue * (spread.p75 / spread.median)));
+    const rangeLo = Math.max(1, Math.round(s.impliedValue * (calibration.resid_p25 / calibration.resid_median)));
+    const rangeHi = Math.max(rangeLo, Math.round(s.impliedValue * (calibration.resid_p75 / calibration.resid_median)));
+    const rangeP10 = Math.max(1, Math.round(s.impliedValue * (calibration.resid_p10 / calibration.resid_median)));
+    const rangeP90 = Math.max(rangeHi, Math.round(s.impliedValue * (calibration.resid_p90 / calibration.resid_median)));
     const plan = farmPlan(s);
     const net = s.econ.farmer_drop_usd * s.odds - s.econ.fees_usd;
-    const bootRange = boot.get(s.slug) ?? { lo: i + 1, hi: i + 1 };
+    const bootRange = boot.ranges.get(s.slug) ?? { lo: i + 1, hi: i + 1 };
     return {
       slug: s.slug,
       name: s.name,
@@ -1076,6 +1383,8 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       odds_peers_with_token: s.oddsPeersWithToken,
       range_lo_usd: rangeLo,
       range_hi_usd: rangeHi,
+      range_p10_usd: rangeP10,
+      range_p90_usd: rangeP90,
       verdict: s.verdict,
       net_usd: net,
       net_per_hour_usd: s.netPerHour,
@@ -1086,7 +1395,6 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     };
   });
 
-  const { evidence, ablation } = computeEvidence(snapshot, fit);
   const tokenRecorded = snapshot.protocols.filter(recordsToken).length;
   const accounting: Accounting = {
     ranked: board.length,
@@ -1139,6 +1447,8 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       bootstrap_seed: BOOTSTRAP_SEED,
     },
     ablation,
+    odds_ablation: oddsAblation,
+    calibration,
     term_ranges: termRanges,
   };
   return { board, radar };
@@ -1179,6 +1489,9 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
     if (row.if_launches_usd < row.implied_value_usd) return `row ${row.slug}: if-launches below implied value`;
     if (!(row.range_lo_usd >= 1 && row.range_lo_usd <= row.implied_value_usd && row.implied_value_usd <= row.range_hi_usd)) {
       return `row ${row.slug} has a range that does not bracket its value`;
+    }
+    if (!(row.range_p10_usd >= 1 && row.range_p10_usd <= row.range_lo_usd && row.range_hi_usd <= row.range_p90_usd)) {
+      return `row ${row.slug} has a P10–P90 range that does not bracket its P25–P75 range`;
     }
     if (row.verdict !== 'FARM' && row.verdict !== 'MARGINAL' && row.verdict !== 'SKIP') {
       return `row ${row.slug} has verdict ${row.verdict}`;

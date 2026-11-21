@@ -1,6 +1,5 @@
 // app.js — Token Launch Radar dashboard. No network, no framework.
-// Renders window.TOKEN_RADAR (written by main.ts as ../data.js): a sortable,
-// filterable board of 198 pre-token protocols and a detail view per protocol.
+// Renders window.TOKEN_RADAR: a sortable board of 198 pre-token protocols and a detail view.
 
 (function () {
   'use strict';
@@ -14,7 +13,7 @@
     return n;
   }
 
-  /** $48.4M, $1.24B, $88.1K, $950 — one decimal, whole dollars never rounded up in display. */
+  /** $48.4M, $1.24B, $88.1K — one decimal. */
   function money(v) {
     if (v >= 1e9) return '$' + (v / 1e9).toFixed(2) + 'B';
     if (v >= 1e6) return '$' + (v / 1e6).toFixed(1) + 'M';
@@ -22,7 +21,7 @@
     return '$' + Math.round(v);
   }
   function moneyFull(v) { return '$' + Math.round(v).toLocaleString('en-US'); }
-  /** Small amounts (gas, fees) where rounding to whole dollars would read $0. */
+  /** Small amounts, where whole dollars would read $0. */
   function moneySmall(v) {
     if (v >= 1) return money(v);
     return '$' + v.toFixed(2);
@@ -61,21 +60,28 @@
     evidenceEl.innerHTML =
       '<strong>Model:</strong> ln(mcap) = ' +
       f.intercept.toFixed(2) + ' + ' + f.slope.toFixed(2) +
-      ' &times; ln(TVL) (R&sup2; ' + f.r2.toFixed(2) + ', ' + f.n_comps + ' comps). Held out: leave-one-out &times;' +
+      ' &times; ln(TVL) (R&sup2; ' + f.r2.toFixed(2) + ', slope ' + f.slope.toFixed(2) + ' ± ' + f.slope_se.toFixed(2) + ', ' + f.n_comps + ' comps). Held out: leave-one-out &times;' +
       e.loo_fitted.toFixed(2) + ' vs flat &times;' + e.loo_flat.toFixed(2) + ', walk-forward &times;' +
       e.wf_fitted.toFixed(2) + ' vs flat &times;' + e.wf_flat.toFixed(2) + '.';
   }
   var ev2 = document.getElementById('evidence2');
   if (ev2 && D.ablation && D.assumptions) {
-    var ab0 = D.ablation[0];
     var widths = rows.map(function (r) { return r.rank_hi - r.rank_lo; }).sort(function (a, b) { return a - b; });
     var medW = widths[Math.floor(widths.length / 2)];
     ev2.innerHTML =
       '<strong>How sure is a rank?</strong> The curve was refitted ' + D.assumptions.bootstrap_draws +
-      ' times on resampled comps (bootstrap, fixed seed) and the board re-ranked: the median row\u2019s rank spans ' +
+      ' times on resampled comps and the board re-ranked: the median row\u2019s rank spans ' +
       medW + ' places (P5–P95), rank 1 sits at ' + rows[0].rank_lo + '–' + rows[0].rank_hi +
-      '. Only the curve improves the held-out miss (leave-one-out &times;' + ab0.loo_miss.toFixed(2) +
-      '); category, growth and age do not — see the validation table in any detail view.';
+      '. See the validation table in any detail view.';
+  }
+  var ev3 = document.getElementById('evidence3');
+  if (ev3 && D.calibration) {
+    var c = D.calibration;
+    ev3.innerHTML = '<strong>Is the range honest?</strong> P25–P75 holds the real cap for ' +
+      Math.round(c.loo_p2575 * 100) + '% held out, ' + Math.round(c.wf_p2575 * 100) +
+      '% walk-forward (50% stated); P10–P90 ' + Math.round(c.loo_p1090 * 100) + '% / ' +
+      Math.round(c.wf_p1090 * 100) + '% (80% stated). Old ranges: ' +
+      Math.round(c.old_loo_p2575 * 100) + '% / ' + Math.round(c.old_wf_p2575 * 100) + '%.';
   }
   var acctEl = document.getElementById('accounting');
   if (acctEl && D.accounting) {
@@ -90,7 +96,7 @@
       '<div class="acct-legend">' +
       '<span><i class="dot ranked"></i>' + a.ranked + ' ranked here</span>' +
       '<span><i class="dot token"></i>' + a.token_recorded + ' already record a token</span>' +
-      '<span><i class="dot left"></i>' + a.left_out + ' excluded by the watchlist rule (bridges, staking, CEX products, versioned or wrapped names)</span>' +
+      '<span><i class="dot left"></i>' + a.left_out + ' excluded by the watchlist rule</span>' +
       '<span class="acct-total">' + a.total + ' protocols in the snapshot</span>' +
       '</div>';
   }
@@ -109,8 +115,6 @@
   // ---- state -------------------------------------------------------------
   var state = { q: '', cat: '', chain: '', minTvl: 0, wl: false, sort: 'rank', dir: 1 };
   var A = D.assumptions;
-  // The farm scenario the sliders control: deposit, drop-share, gas multiplier.
-  // The board's net and verdict are recomputed live from the same formulas.
   var scen = { dep: A.deposit_usd, share: A.drop_pool_pct, gas: 1 };
   function netAt(r, dep, share, gas) {
     var drop = share * r.implied_value_usd;
@@ -235,40 +239,38 @@
       [money(r.tvl_usd), 'TVL'],
       [pct(r.change_7d), 'TVL change, 7 days'],
       [r.age_years.toFixed(2) + ' yrs', 'no-token age'],
-      ['× ' + r.multiple.toFixed(2), 'category factor (' + (r.multiple_source === 'category' ? 'from its category' : 'no adjustment') + ')'],
+      ['× ' + r.multiple.toFixed(2), 'category factor (' + (r.multiple_source === 'category' ? 'category' : 'none') + ')'],
     ].map(function (s) { return '<div class="stat"><b>' + s[0] + '</b><span>' + s[1] + '</span></div>'; }).join('');
     var br = document.getElementById('d-break');
-    var curveValue = r.if_launches_usd / (r.multiple * r.growth_factor * r.age_factor);
+    var curveValue = r.if_launches_usd / (r.multiple * r.growth_factor);
+    var oddsSe = Math.sqrt(r.token_odds * (1 - r.token_odds) / (r.odds_peers + 20));
     br.innerHTML =
       '<tr><td>Size curve at this TVL (fitted, ' + D.fit.n_comps + ' comps)</td><td>' + moneyFull(curveValue) + '</td></tr>' +
       '<tr><td>× Category factor (' + r.category + ', shrunk median ratio' + (r.multiple_source === 'category' ? '' : ' — too few peers, no adjustment') + ')</td><td>× ' + r.multiple.toFixed(3) + '</td></tr>' +
       '<tr><td>× Growth factor (7d ' + pct(r.change_7d) + ')</td><td>× ' + r.growth_factor.toFixed(3) + '</td></tr>' +
-      '<tr><td>× Age factor (' + r.age_years.toFixed(2) + ' yrs)</td><td>× ' + r.age_factor.toFixed(3) + '</td></tr>' +
+      '<tr><td>× Age factor — tested, not kept</td><td>× 1.000</td></tr>' +
       '<tr class="total"><td>= Value if it launches</td><td>' + moneyFull(r.if_launches_usd) + '</td></tr>' +
-      '<tr><td>× Token odds (' + r.odds_peers_with_token + ' of ' + r.odds_peers + ' peers record a token)</td><td>× ' + r.token_odds.toFixed(3) + '</td></tr>' +
+      '<tr><td>× Token odds (' + r.odds_peers_with_token + ' of ' + r.odds_peers + ' peers record a token)</td><td>× ' + r.token_odds.toFixed(3) + ' ± ' + oddsSe.toFixed(3) + '</td></tr>' +
       '<tr class="total"><td>= Implied launch value</td><td>' + moneyFull(r.implied_value_usd) + '</td></tr>' +
-      '<tr><td>Value range P25–P75</td><td>' + moneyFull(r.range_lo_usd) + ' – ' + moneyFull(r.range_hi_usd) + '</td></tr>';
+      '<tr><td>Value range P25–P75 (P10–P90)</td><td>' + moneyFull(r.range_lo_usd) + ' – ' + moneyFull(r.range_hi_usd) + ' (' + moneyFull(r.range_p10_usd) + ' – ' + moneyFull(r.range_p90_usd) + ')</td></tr>';
 
     // ---- term-by-term validation -------------------------------------------
     var ab = document.getElementById('d-ablation');
-    ab.innerHTML = '<tr><th>Term</th><th>LOO miss</th><th>Verdict</th></tr>' +
-      D.ablation.map(function (a, i) {
-        var v = i === 0 ? 'kept — improves the miss'
-          : a.loo_miss < D.ablation[i - 1].loo_miss ? 'helps a little'
-          : 'no help — kept for its reason, not for prediction';
-        return '<tr><td>' + a.label + '</td><td class="num">×' + a.loo_miss.toFixed(2) + '</td><td class="' + (i ? 'bad' : '') + '">' + a.note + ' · ' + v + '</td></tr>';
+    ab.innerHTML = '<tr><th>Term</th><th class="num">LOO</th><th class="num">Walk-forward</th><th>Verdict</th></tr>' +
+      D.ablation.map(function (a) {
+        return '<tr><td>' + a.label + '</td><td class="num">×' + a.loo_miss.toFixed(2) + '</td><td class="num">×' + a.wf_miss.toFixed(2) + '</td><td class="' + (a.verdict === 'dropped' ? 'bad' : '') + '">' + a.verdict + ' — ' + a.note + '</td></tr>';
       }).join('') +
-      '<tr><td>Flat multiple</td><td class="num">×' + D.evidence.loo_flat.toFixed(2) + '</td><td>baseline</td></tr>';
+      '<tr><td>Flat multiple</td><td class="num">×' + D.evidence.loo_flat.toFixed(2) + '</td><td class="num">×' + D.evidence.wf_flat.toFixed(2) + '</td><td>baseline</td></tr>' +
+      '<tr><th colspan="4">Token odds (Brier, lower is better)</th></tr>' +
+      D.odds_ablation.map(function (a) {
+        return '<tr><td>' + a.label + '</td><td class="num">' + a.loo_brier.toFixed(3) + '</td><td class="num">' + a.wf_brier.toFixed(3) + '</td><td class="' + (a.verdict === 'dropped' ? 'bad' : '') + '">' + a.verdict + '</td></tr>';
+      }).join('');
     var tr2 = D.term_ranges;
     document.getElementById('d-ablation-note').textContent =
-      'Each row adds a term and re-runs leave-one-out over the ' + D.fit.n_comps +
-      ' traded comps. Only the curve improves the miss (×' + D.ablation[0].loo_miss.toFixed(2) +
-      ' vs ×' + D.evidence.loo_flat.toFixed(2) + ' flat). Ranges on this board: category ×' +
+      'Each row adds a term and re-runs both tests over the ' + D.fit.n_comps +
+      ' traded comps. A term stays only if it lowers the miss — or the Brier score — on both. Ranges: category ×' +
       tr2.category[0].toFixed(2) + '–×' + tr2.category[1].toFixed(2) + ', growth ×' + tr2.growth[0].toFixed(2) +
-      '–×' + tr2.growth[1].toFixed(2) + ', age ×' + tr2.age[0].toFixed(2) + '–×' + tr2.age[1].toFixed(2) +
-      ', odds ' + Math.round(tr2.odds[0] * 100) + '%–' + Math.round(tr2.odds[1] * 100) +
-      '%. Odds are judged by Brier (' + D.evidence.brier_odds.toFixed(3) + ' vs ' +
-      D.evidence.brier_base.toFixed(3) + ' base), not by this miss.';
+      '–×' + tr2.growth[1].toFixed(2) + ', odds ' + Math.round(tr2.odds[0] * 100) + '%–' + Math.round(tr2.odds[1] * 100) + '% (age was tested in the value model, kept only in the odds).';
 
     var econ = document.getElementById('d-econ');
     econ.textContent = '';
@@ -295,11 +297,11 @@
     ].map(function (s) { return '<div class="stat"><b>' + s[0] + '</b><span>' + s[1] + '</span></div>'; }).join('');
     econ.appendChild(egrid);
     var as = D.assumptions;
-    econ.appendChild(el('p', 'note', 'Assumptions: drop pool 2% of implied value; the farming pool is 5% of TVL and your share is the deposit over it; gas ' + moneySmall(as.gas_usd.Ethereum) + ' per transaction on Ethereum, ' + moneySmall(as.gas_usd.Solana) + ' on Solana, ' + moneySmall(as.gas_usd.Bitcoin) + ' on Bitcoin, ' + moneySmall(as.gas_default_usd) + ' elsewhere; each step is counted once, at its stated minutes. FARM means net over $750 and over $500 an hour; SKIP means net under $100. T-bill ' + (as.tbill_rate * 100).toFixed(2) + '% a year (US 3-month Treasury bill, Federal Reserve H.15, ' + as.tbill_as_of + ') over the ' + as.tbill_hold_days + '-day minimum hold the plans ask for.'));
+    econ.appendChild(el('p', 'note', 'Assumptions: drop pool 2% of implied value; the farming pool is 5% of TVL and your share is the deposit over it; gas ' + moneySmall(as.gas_usd.Ethereum) + ' per transaction on Ethereum, ' + moneySmall(as.gas_usd.Solana) + ' on Solana, ' + moneySmall(as.gas_usd.Bitcoin) + ' on Bitcoin, ' + moneySmall(as.gas_default_usd) + ' elsewhere, plus $2 per bridge step; each step counted once, at its stated minutes. FARM: net over $750 and over $500 an hour; SKIP: net under $100. T-bill ' + (as.tbill_rate * 100).toFixed(2) + '% a year (US 3-month Treasury bill, Federal Reserve H.15, ' + as.tbill_as_of + ') over the ' + as.tbill_hold_days + '-day minimum hold.'));
 
     // ---- deposit × drop-share matrix ---------------------------------------
     var mx = document.getElementById('d-matrix');
-    mx.innerHTML = '<tr><th>Deposit / share</th><th class="num">1%</th><th class="num">2%</th><th class="num">5%</th></tr>' +
+    mx.innerHTML = '<tr><th>Deposit</th><th class="num">1%</th><th class="num">2%</th><th class="num">5%</th></tr>' +
       [1000, 10000, 50000].map(function (dep) {
         return '<tr><td>' + moneyFull(dep) + '</td>' + [0.01, 0.02, 0.05].map(function (sh) {
           var net = netAt(r, dep, sh, 1);
@@ -313,7 +315,7 @@
     r.farm_steps.forEach(function (s) { farm.appendChild(el('li', null, s)); });
 
     var peersEl = document.getElementById('d-peers');
-    peersEl.innerHTML = '<tr><th>Protocol</th><th>TVL</th><th>Market cap</th><th>Cap / TVL</th><th>Curve multiple</th></tr>' +
+    peersEl.innerHTML = '<tr><th>Protocol</th><th>TVL</th><th>Market cap</th><th>Cap / TVL</th><th>Multiple</th></tr>' +
       r.peers.map(function (p) {
         return '<tr><td>' + p.name + (p.same_category ? '' : ' (other category)') + '</td><td class="num">' + money(p.tvl_usd) + '</td><td class="num">' + money(p.mcap_usd) + '</td><td class="num">' + p.cap_tvl.toFixed(2) + '×</td><td class="num">' + p.curve_multiple.toFixed(3) + '×</td></tr>';
       }).join('');

@@ -36,6 +36,7 @@ button:hover{border-color:var(--accent)}
 .board{overflow-x:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px}
 table{width:100%;border-collapse:collapse}
 th,td{padding:10px 8px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+.detail th,.detail td{padding:8px}
 thead th{position:sticky;top:0;background:var(--panel2);color:var(--muted);
   font-size:12px;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;user-select:none}
 thead th:hover{color:var(--text)}
@@ -113,7 +114,7 @@ footer{max-width:1180px;margin:0 auto;padding:8px 20px 34px;color:var(--faint);f
 .peers{width:100%;border-collapse:collapse;margin:4px 0}
 .peers th{color:var(--muted);font-size:12px;letter-spacing:.08em;text-transform:uppercase;
   text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);cursor:default}
-.peers td{padding:8px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
+.peers td{padding:6px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
 .peers td.num{text-align:right;font-variant-numeric:tabular-nums}
 @media (max-width:760px){
   .stats,.d-grid,.econ-grid{grid-template-columns:repeat(2,1fr)}
