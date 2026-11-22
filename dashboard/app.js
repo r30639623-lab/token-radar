@@ -1,6 +1,3 @@
-// app.js — Token Launch Radar dashboard. No network, no framework.
-// Renders window.TOKEN_RADAR: a sortable board of 198 pre-token protocols and a detail view.
-
 (function () {
   'use strict';
   var D = window.TOKEN_RADAR;
@@ -12,8 +9,9 @@
     if (text !== undefined && text !== null) n.textContent = text;
     return n;
   }
+  function gid(id) { return document.getElementById(id); }
+  function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 
-  /** $48.4M, $1.24B, $88.1K — one decimal. */
   function money(v) {
     if (v >= 1e9) return '$' + (v / 1e9).toFixed(2) + 'B';
     if (v >= 1e6) return '$' + (v / 1e6).toFixed(1) + 'M';
@@ -21,7 +19,6 @@
     return '$' + Math.round(v);
   }
   function moneyFull(v) { return '$' + Math.round(v).toLocaleString('en-US'); }
-  /** Small amounts, where whole dollars would read $0. */
   function moneySmall(v) {
     if (v >= 1) return money(v);
     return '$' + v.toFixed(2);
@@ -34,25 +31,28 @@
     return chains.length > 2 ? chains[0] + ' +' + (chains.length - 1) : chains.join(', ');
   }
 
-  // ---- stats strip -------------------------------------------------------
   var stats = document.getElementById('stats');
   var wlCount = rows.filter(function (r) { return r.watchlist; }).length;
   var farmCount = rows.filter(function (r) { return r.verdict === 'FARM'; }).length;
+  var keptValue = D.ablation.filter(function (a) { return a.verdict === 'kept'; }).length;
+  var keptOdds = D.odds_ablation.filter(function (a) { return a.verdict === 'kept'; }).length;
   var statData = [
-    [String(rows.length), 'protocols ranked'],
-    [wlCount + ' / ' + D.watchlist_size, 'watchlist covered'],
-    [money(D.total_implied_usd), 'total implied value'],
-    [String(farmCount), 'FARM verdicts'],
+    ['×' + D.evidence.wf_fitted.toFixed(2), 'walk-forward miss'],
+    [Math.round(D.calibration.wf_p2575 * 100) + '% · ' + Math.round(D.calibration.wf_p1090 * 100) + '%', 'range honesty (WF)'],
+    [D.evidence.brier_odds.toFixed(3), 'odds Brier, 10-fold'],
+    [keptValue + '/4 · ' + keptOdds + '/4', 'terms survived'],
+    [String(farmCount), 'worth farming'],
+    [wlCount + ' / ' + D.watchlist_size, 'watchlist'],
+    [money(D.total_implied_usd), 'total implied'],
   ];
   statData.forEach(function (s, i) {
     var box = el('div', 'stat');
-    var b = el('b', i === 3 ? 'green' : null, s[0]);
+    var b = el('b', i === 4 ? 'green' : null, s[0]);
     box.appendChild(b);
     box.appendChild(el('span', null, s[1]));
     stats.appendChild(box);
   });
 
-  // ---- evidence strip + accounting bar -----------------------------------
   var evidenceEl = document.getElementById('evidence');
   if (evidenceEl && D.fit && D.evidence) {
     var f = D.fit;
@@ -60,8 +60,8 @@
     evidenceEl.innerHTML =
       '<strong>Model:</strong> ln(mcap) = ' +
       f.intercept.toFixed(2) + ' + ' + f.slope.toFixed(2) +
-      ' &times; ln(TVL) (R&sup2; ' + f.r2.toFixed(2) + ', slope ' + f.slope.toFixed(2) + ' ± ' + f.slope_se.toFixed(2) + ', ' + f.n_comps + ' comps). Held out: leave-one-out &times;' +
-      e.loo_fitted.toFixed(2) + ' vs flat &times;' + e.loo_flat.toFixed(2) + ', walk-forward &times;' +
+      ' &times; ln(TVL) (R&sup2; ' + f.r2.toFixed(2) + ', slope ± ' + f.slope_se.toFixed(2) + ', ' + f.n_comps + ' comps). Held out LOO &times;' +
+      e.loo_fitted.toFixed(2) + ' vs flat &times;' + e.loo_flat.toFixed(2) + ', WF &times;' +
       e.wf_fitted.toFixed(2) + ' vs flat &times;' + e.wf_flat.toFixed(2) + '.';
   }
   var ev2 = document.getElementById('evidence2');
@@ -69,10 +69,8 @@
     var widths = rows.map(function (r) { return r.rank_hi - r.rank_lo; }).sort(function (a, b) { return a - b; });
     var medW = widths[Math.floor(widths.length / 2)];
     ev2.innerHTML =
-      '<strong>How sure is a rank?</strong> The curve was refitted ' + D.assumptions.bootstrap_draws +
-      ' times on resampled comps and the board re-ranked: the median row\u2019s rank spans ' +
-      medW + ' places (P5–P95), rank 1 sits at ' + rows[0].rank_lo + '–' + rows[0].rank_hi +
-      '. See the validation table in any detail view.';
+      '<strong>How sure is a rank?</strong> ' + D.assumptions.bootstrap_draws +
+      ' refits: median rank spans ' + medW + ' places (P5–P95).';
   }
   var ev3 = document.getElementById('evidence3');
   if (ev3 && D.calibration) {
@@ -80,7 +78,7 @@
     ev3.innerHTML = '<strong>Is the range honest?</strong> P25–P75 holds the real cap for ' +
       Math.round(c.loo_p2575 * 100) + '% held out, ' + Math.round(c.wf_p2575 * 100) +
       '% walk-forward (50% stated); P10–P90 ' + Math.round(c.loo_p1090 * 100) + '% / ' +
-      Math.round(c.wf_p1090 * 100) + '% (80% stated). Old ranges: ' +
+      Math.round(c.wf_p1090 * 100) + '% (80% stated). Old: ' +
       Math.round(c.old_loo_p2575 * 100) + '% / ' + Math.round(c.old_wf_p2575 * 100) + '%.';
   }
   var acctEl = document.getElementById('accounting');
@@ -88,20 +86,23 @@
     var a = D.accounting;
     var pctOf = function (n) { return Math.round((n / a.total) * 100); };
     acctEl.innerHTML =
-      '<div class="acct-bar">' +
-      '<span class="acct-seg acct-ranked" style="width:' + pctOf(a.ranked) + '%"></span>' +
-      '<span class="acct-seg acct-token" style="width:' + pctOf(a.token_recorded) + '%"></span>' +
-      '<span class="acct-seg acct-left" style="width:' + pctOf(a.left_out) + '%"></span>' +
-      '</div>' +
       '<div class="acct-legend">' +
-      '<span><i class="dot ranked"></i>' + a.ranked + ' ranked here</span>' +
-      '<span><i class="dot token"></i>' + a.token_recorded + ' already record a token</span>' +
-      '<span><i class="dot left"></i>' + a.left_out + ' excluded by the watchlist rule</span>' +
-      '<span class="acct-total">' + a.total + ' protocols in the snapshot</span>' +
+      '<span><i class="dot ranked"></i>' + a.ranked + ' ranked</span>' +
+      '<span><i class="dot token"></i>' + a.token_recorded + ' record a token</span>' +
+      '<span><i class="dot left"></i>' + a.left_out + ' left out</span>' +
+      '<span class="acct-total">' + a.total + ' in the snapshot</span>' +
       '</div>';
   }
 
-  // ---- filter options ----------------------------------------------------
+  var intEl = document.getElementById('integrity');
+  if (intEl && D.accounting) {
+    var a = D.accounting;
+    var ck = function (b) { return b ? '✓ ' : '✗ '; };
+    var rk = rows.every(function (r, i) { return r.rank === i + 1; });
+    var so = rows.every(function (r, i) { return i === 0 || r.implied_value_usd <= rows[i - 1].implied_value_usd; });
+    intEl.innerHTML = '<strong>Integrity:</strong> ' + ck(1) + rows.length + ' rows · ' + ck(rk) + 'ranks in order · ' + ck(so) + 'values sorted · ' + ck(wlCount === D.watchlist_size) + wlCount + '/' + D.watchlist_size + ' watchlist · ' + ck(a.ranked + a.token_recorded + a.left_out === a.total) + a.ranked + ' + ' + a.token_recorded + ' + ' + a.left_out + ' = ' + a.total + ' · ' + ck(1) + 'offline';
+  }
+
   var catSel = document.getElementById('cat');
   var chainSel = document.getElementById('chain');
   var cats = [], chains = [];
@@ -112,8 +113,8 @@
   cats.sort().forEach(function (c) { catSel.appendChild(el('option', null, c)); });
   chains.sort().forEach(function (c) { chainSel.appendChild(el('option', null, c)); });
 
-  // ---- state -------------------------------------------------------------
-  var state = { q: '', cat: '', chain: '', minTvl: 0, wl: false, sort: 'rank', dir: 1 };
+  var DEF = { q: '', cat: '', chain: '', minTvl: 0, wl: false, tab: 'all', tier: 'all', sort: 'rank', dir: 1 };
+  var state = Object.assign({}, DEF);
   var A = D.assumptions;
   var scen = { dep: A.deposit_usd, share: A.drop_pool_pct, gas: 1 };
   function netAt(r, dep, share, gas) {
@@ -132,70 +133,95 @@
     document.getElementById('shareOut').textContent = (scen.share * 100).toFixed(1) + '%';
     document.getElementById('gasOut').textContent = scen.gas + '×';
   }
-  var sortKeys = {
-    rank: function (r) { return r.rank; },
-    rank_lo: function (r) { return r.rank_lo; },
-    name: function (r) { return r.name.toLowerCase(); },
-    category: function (r) { return r.category; },
-    chains: function (r) { return r.chains[0] || ''; },
-    tvl_usd: function (r) { return r.tvl_usd; },
-    change_7d: function (r) { return r.change_7d === null ? -Infinity : r.change_7d; },
-    implied_value_usd: function (r) { return r.implied_value_usd; },
-    token_odds: function (r) { return r.token_odds; },
-    net_per_hour_usd: function (r) { return scenNet(r) / r.econ.hours; },
-  };
+  function sortKey(r) {
+    var k = state.sort;
+    if (k === 'name') return r.name.toLowerCase();
+    if (k === 'chains') return r.chains[0] || '';
+    if (k === 'change_7d') return r.change_7d === null ? -Infinity : r.change_7d;
+    if (k === 'net_per_hour_usd') return scenNet(r) / r.econ.hours;
+    return r[k];
+  }
 
   function filtered() {
     var q = state.q.trim().toLowerCase();
     var list = rows.filter(function (r) {
       if (state.wl && !r.watchlist) return false;
+      if (state.tab !== 'all' && scenVerdict(r, scenNet(r)) !== state.tab) return false;
+      if (state.tier === 'watchlist' && !r.watchlist) return false;
+      if (state.tier === 'early' && r.tvl_usd >= 5e7) return false;
+      if (state.tier === 'offlist' && (r.watchlist || r.tvl_usd < 5e7)) return false;
       if (state.cat && r.category !== state.cat) return false;
       if (state.chain && r.chains.indexOf(state.chain) < 0) return false;
       if (r.tvl_usd < state.minTvl) return false;
       if (q && r.name.toLowerCase().indexOf(q) < 0 && r.slug.indexOf(q) < 0) return false;
       return true;
     });
-    var key = sortKeys[state.sort];
     list.sort(function (a, b) {
-      var x = key(a), y = key(b);
+      var x = sortKey(a), y = sortKey(b);
       return (x < y ? -1 : x > y ? 1 : 0) * state.dir;
     });
     return list;
   }
 
-  // ---- table -------------------------------------------------------------
+  var tabsEl = document.getElementById('tabs');
+  var vBtns = {}, tBtns = {};
+  function tab(kind, key, label) {
+    var b = el('button', 'tab', label);
+    b.addEventListener('click', function () { if (kind) state.tab = key; else state.tier = key; syncTabs(); render(); });
+    tabsEl.appendChild(b);
+    return b;
+  }
+  vBtns.all = tab(1, 'all', 'All');
+  vBtns.FARM = tab(1, 'FARM', 'FARM');
+  vBtns.MARGINAL = tab(1, 'MARGINAL', 'MARGINAL');
+  vBtns.SKIP = tab(1, 'SKIP', 'SKIP');
+  tBtns.all = tab(0, 'all', 'All tiers');
+  tBtns.watchlist = tab(0, 'watchlist', 'Watchlist');
+  tBtns.early = tab(0, 'early', 'Early');
+  tBtns.offlist = tab(0, 'offlist', 'Off-list');
+  var vk = ['all', 'FARM', 'MARGINAL', 'SKIP'], tk = ['all', 'watchlist', 'early', 'offlist'];
+  function syncTabs() {
+    var i, c = { all: 0, FARM: 0, MARGINAL: 0, SKIP: 0 };
+    for (i = 0; i < 4; i++) { vBtns[vk[i]].classList.toggle('on', state.tab === vk[i]); tBtns[tk[i]].classList.toggle('on', state.tier === tk[i]); }
+    rows.forEach(function (r) { c[scenVerdict(r, scenNet(r))]++; c.all++; });
+    for (i = 0; i < 4; i++) vBtns[vk[i]].textContent = (vk[i] === 'all' ? 'All ' : vk[i] + ' ') + c[vk[i]];
+  }
+  function download(name, type, text) {
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: type }));
+    a.download = name;
+    a.click();
+  }
+  function csvOf(list) {
+    var h = 'rank,name,slug,implied_value_usd,token_odds,verdict,net_usd,net_per_hour_usd,tvl_usd,category,chains';
+    return h + '\n' + list.map(function (r) {
+      var n = scenNet(r);
+      return [r.rank, '"' + r.name.replace(/"/g, '""') + '"', r.slug, r.implied_value_usd, r.token_odds.toFixed(3), scenVerdict(r, n), Math.round(n), Math.round(n / r.econ.hours), r.tvl_usd, '"' + r.category + '"', '"' + r.chains.join(' ') + '"'].join(',');
+    }).join('\n') + '\n';
+  }
+  var ex = el('button', 'tab', 'Export CSV');
+  ex.addEventListener('click', function () { download('token-radar.csv', 'text/csv', csvOf(filtered())); });
+  tabsEl.appendChild(ex);
+  ex = el('button', 'tab', 'Export JSON');
+  ex.addEventListener('click', function () { download('token-radar.json', 'application/json', JSON.stringify(filtered(), null, 2)); });
+  tabsEl.appendChild(ex);
+
   var tbody = document.getElementById('rows');
   var countEl = document.getElementById('count');
   var activeSlug = null;
 
   function render() {
     var list = filtered();
+    syncTabs();
     tbody.textContent = '';
     list.forEach(function (r) {
       var tr = el('tr');
       if (r.slug === activeSlug) tr.className = 'active';
-      tr.appendChild(el('td', 'num', String(r.rank)));
-      tr.appendChild(el('td', 'num rng', r.rank_lo + '–' + r.rank_hi));
-      var nameTd = el('td');
-      nameTd.appendChild(el('span', 'nm', r.name));
-      if (r.watchlist) nameTd.appendChild(el('span', 'badge', 'WATCHLIST'));
-      nameTd.appendChild(el('div', 'sl', r.slug));
-      tr.appendChild(nameTd);
-      tr.appendChild(el('td', 'num val', money(r.implied_value_usd)));
-      var oddsTd = el('td', 'num');
-      oddsTd.innerHTML = Math.round(r.token_odds * 100) + '%<div class="sl">' + r.odds_peers + ' peers</div>';
-      tr.appendChild(oddsTd);
       var sNet = scenNet(r);
       var sVerd = scenVerdict(r, sNet);
-      var vTd = el('td');
-      vTd.innerHTML = '<span class="verdict verdict-' + sVerd.toLowerCase() + '">' + sVerd + '</span>';
-      tr.appendChild(vTd);
-      tr.appendChild(el('td', 'num', money(sNet / r.econ.hours)));
-      tr.appendChild(el('td', 'num', money(r.tvl_usd)));
-      var ch = el('td', 'num ' + (r.change_7d === null ? 'flat' : r.change_7d > 0 ? 'up' : r.change_7d < 0 ? 'down' : 'flat'), pct(r.change_7d));
-      tr.appendChild(ch);
-      tr.appendChild(el('td', 'pill', r.category));
-      tr.appendChild(el('td', 'pill', chainsShort(r.chains)));
+      var chCls = r.change_7d === null ? 'flat' : r.change_7d > 0 ? 'up' : r.change_7d < 0 ? 'down' : 'flat';
+      var fam = r.odds_family_adj >= 0 ? '+' + r.odds_family_adj.toFixed(2) : r.odds_family_adj.toFixed(2);
+      tr.innerHTML = '<td class="num">' + r.rank + '</td><td class="num rng">' + r.rank_lo + '–' + r.rank_hi + '</td><td><span class="nm">' + esc(r.name) + '</span>' + (r.watchlist ? '<span class="badge">WATCHLIST</span>' : '') + '<div class="sl">' + r.slug + '</div></td><td class="num val">' + money(r.implied_value_usd) + '</td><td class="num">' + Math.round(r.token_odds * 100) + '%<div class="sl">family ' + fam + '</div></td><td><span class="verdict verdict-' + sVerd.toLowerCase() + '">' + sVerd + '</span><div class="sl">' + money(sNet) + ' net</div></td><td class="num">' + money(sNet / r.econ.hours) + '</td><td class="num">' + money(r.tvl_usd) + '</td><td class="num ' + chCls + '">' + pct(r.change_7d) + '</td><td class="pill">' + esc(r.category) + '</td><td class="pill">' + esc(chainsShort(r.chains)) + '</td>';
       tr.addEventListener('click', function () { showDetail(r.slug); });
       tbody.appendChild(tr);
     });
@@ -218,64 +244,67 @@
     });
   });
 
-  // ---- detail ------------------------------------------------------------
-  var detail = document.getElementById('detail');
+  var detail = gid('detail');
   function showDetail(slug) {
     var r = null;
     for (var i = 0; i < rows.length; i++) if (rows[i].slug === slug) { r = rows[i]; break; }
     if (!r) return;
     activeSlug = slug;
-    document.getElementById('d-rank').textContent = 'Rank #' + r.rank + ' · ' + r.rank_lo + '–' + r.rank_hi + ' across ' + D.assumptions.bootstrap_draws + ' bootstrap refits' + (r.watchlist ? ' · Watchlist' : '');
-    document.getElementById('d-name').textContent = r.name;
-    document.getElementById('d-sub').textContent = r.category + ' · ' + r.chains.join(', ') +
+    gid('d-rank').textContent = 'Rank #' + r.rank + ' · ' + r.rank_lo + '–' + r.rank_hi + ' across ' + D.assumptions.bootstrap_draws + ' bootstrap refits' + (r.watchlist ? ' · Watchlist' : '');
+    gid('d-name').textContent = r.name;
+    gid('d-sub').textContent = r.category + ' · ' + r.chains.join(', ') +
       ' · Listed ' + (r.listed_at || 'date not recorded') + ' · ' + r.token_status;
-    var grid = document.getElementById('d-grid');
+    var grid = gid('d-grid');
     grid.innerHTML = [
       [money(r.implied_value_usd), 'implied launch value'],
-      [money(r.if_launches_usd), 'value if it launches'],
-      [Math.round(r.token_odds * 100) + '%', 'token odds (' + r.odds_peers_with_token + ' of ' + r.odds_peers + ' peers)'],
+      [Math.round(r.token_odds * 100) + '%', 'token odds (' + r.odds_peers_with_token + ' of ' + r.odds_peers + ' in ' + r.category + ')'],
       [money(r.range_lo_usd) + ' – ' + money(r.range_hi_usd), 'value range (P25–P75)'],
-      [r.rank_lo + '–' + r.rank_hi, 'rank range (P5–P95)'],
       [money(r.tvl_usd), 'TVL'],
-      [pct(r.change_7d), 'TVL change, 7 days'],
-      [r.age_years.toFixed(2) + ' yrs', 'no-token age'],
       ['× ' + r.multiple.toFixed(2), 'category factor (' + (r.multiple_source === 'category' ? 'category' : 'none') + ')'],
     ].map(function (s) { return '<div class="stat"><b>' + s[0] + '</b><span>' + s[1] + '</span></div>'; }).join('');
-    var br = document.getElementById('d-break');
+    var br = gid('d-break');
     var curveValue = r.if_launches_usd / (r.multiple * r.growth_factor);
-    var oddsSe = Math.sqrt(r.token_odds * (1 - r.token_odds) / (r.odds_peers + 20));
     br.innerHTML =
-      '<tr><td>Size curve at this TVL (fitted, ' + D.fit.n_comps + ' comps)</td><td>' + moneyFull(curveValue) + '</td></tr>' +
-      '<tr><td>× Category factor (' + r.category + ', shrunk median ratio' + (r.multiple_source === 'category' ? '' : ' — too few peers, no adjustment') + ')</td><td>× ' + r.multiple.toFixed(3) + '</td></tr>' +
+      '<tr><td>Size curve at this TVL (fitted)</td><td>' + moneyFull(curveValue) + '</td></tr>' +
+      '<tr><td>× Category factor (' + r.category + (r.multiple_source === 'category' ? '' : ', too few peers') + ')</td><td>× ' + r.multiple.toFixed(3) + '</td></tr>' +
       '<tr><td>× Growth factor (7d ' + pct(r.change_7d) + ')</td><td>× ' + r.growth_factor.toFixed(3) + '</td></tr>' +
       '<tr><td>× Age factor — tested, not kept</td><td>× 1.000</td></tr>' +
       '<tr class="total"><td>= Value if it launches</td><td>' + moneyFull(r.if_launches_usd) + '</td></tr>' +
-      '<tr><td>× Token odds (' + r.odds_peers_with_token + ' of ' + r.odds_peers + ' peers record a token)</td><td>× ' + r.token_odds.toFixed(3) + ' ± ' + oddsSe.toFixed(3) + '</td></tr>' +
+      '<tr><td>× Token odds (' + r.odds_peers_with_token + ' of ' + r.odds_peers + ' in ' + r.category + '; family ' + (r.odds_family_adj >= 0 ? '+' : '') + r.odds_family_adj.toFixed(2) + ')</td><td>× ' + r.token_odds.toFixed(3) + ' ± ' + r.odds_se.toFixed(3) + '</td></tr>' +
       '<tr class="total"><td>= Implied launch value</td><td>' + moneyFull(r.implied_value_usd) + '</td></tr>' +
-      '<tr><td>Value range P25–P75 (P10–P90)</td><td>' + moneyFull(r.range_lo_usd) + ' – ' + moneyFull(r.range_hi_usd) + ' (' + moneyFull(r.range_p10_usd) + ' – ' + moneyFull(r.range_p90_usd) + ')</td></tr>';
+      '<tr><td>Range P25–P75 (P10–P90)</td><td>' + moneyFull(r.range_lo_usd) + ' – ' + moneyFull(r.range_hi_usd) + ' (' + moneyFull(r.range_p10_usd) + ' – ' + moneyFull(r.range_p90_usd) + ')</td></tr>';
 
-    // ---- term-by-term validation -------------------------------------------
-    var ab = document.getElementById('d-ablation');
+    var ab = gid('d-ablation');
+    var ctrl = D.ablation_control;
+    var octrl = D.odds_control;
     ab.innerHTML = '<tr><th>Term</th><th class="num">LOO</th><th class="num">Walk-forward</th><th>Verdict</th></tr>' +
       D.ablation.map(function (a) {
         return '<tr><td>' + a.label + '</td><td class="num">×' + a.loo_miss.toFixed(2) + '</td><td class="num">×' + a.wf_miss.toFixed(2) + '</td><td class="' + (a.verdict === 'dropped' ? 'bad' : '') + '">' + a.verdict + ' — ' + a.note + '</td></tr>';
       }).join('') +
       '<tr><td>Flat multiple</td><td class="num">×' + D.evidence.loo_flat.toFixed(2) + '</td><td class="num">×' + D.evidence.wf_flat.toFixed(2) + '</td><td>baseline</td></tr>' +
-      '<tr><th colspan="4">Token odds (Brier, lower is better)</th></tr>' +
+      '<tr><td>' + ctrl.label + '</td><td class="num">×' + ctrl.loo_miss.toFixed(2) + '</td><td class="num">×' + ctrl.wf_miss.toFixed(2) + '</td><td>control — ' + ctrl.note + '</td></tr>' +
+      '<tr><th colspan="4">Token odds (Brier, lower is better — 10-fold CV / walk-forward)</th></tr>' +
       D.odds_ablation.map(function (a) {
-        return '<tr><td>' + a.label + '</td><td class="num">' + a.loo_brier.toFixed(3) + '</td><td class="num">' + a.wf_brier.toFixed(3) + '</td><td class="' + (a.verdict === 'dropped' ? 'bad' : '') + '">' + a.verdict + '</td></tr>';
-      }).join('');
+        return '<tr><td>' + a.label + '</td><td class="num">' + a.cv_brier.toFixed(3) + '</td><td class="num">' + a.wf_brier.toFixed(3) + '</td><td class="' + (a.verdict === 'dropped' ? 'bad' : '') + '">' + a.verdict + (a.note ? ' — ' + a.note : '') + '</td></tr>';
+      }).join('') +
+      '<tr><td>' + octrl.label + '</td><td class="num">' + octrl.cv_brier.toFixed(3) + '</td><td class="num">' + octrl.wf_brier.toFixed(3) + '</td><td>control — ' + octrl.note + '</td></tr>';
     var tr2 = D.term_ranges;
-    document.getElementById('d-ablation-note').textContent =
-      'Each row adds a term and re-runs both tests over the ' + D.fit.n_comps +
-      ' traded comps. A term stays only if it lowers the miss — or the Brier score — on both. Ranges: category ×' +
+    var of = D.odds_fit;
+    gid('d-ablation-note').textContent =
+      'Each row adds a term and re-runs both tests. A term stays only if it lowers the miss — or the Brier score — on both. Ranges: category ×' +
       tr2.category[0].toFixed(2) + '–×' + tr2.category[1].toFixed(2) + ', growth ×' + tr2.growth[0].toFixed(2) +
-      '–×' + tr2.growth[1].toFixed(2) + ', odds ' + Math.round(tr2.odds[0] * 100) + '%–' + Math.round(tr2.odds[1] * 100) + '% (age was tested in the value model, kept only in the odds).';
+      '–×' + tr2.growth[1].toFixed(2) + ', odds ' + Math.round(tr2.odds[0] * 100) + '%–' + Math.round(tr2.odds[1] * 100) + '%. ' +
+      'Fitted, ± s.e.: slope ' + D.fit.slope.toFixed(2) + ' ± ' + D.fit.slope_se.toFixed(2) +
+      '; multiple at $100M ×' + D.fit.multiple_at_100m.toFixed(2) + ' ± ' + D.fit.multiple_se.toFixed(2) +
+      '; odds logits: age +' + of.age.toFixed(2) + ' ± ' + of.se.age.toFixed(2) +
+      ', ln TVL +' + of.size.toFixed(2) + ' ± ' + of.se.size.toFixed(2) +
+      ', growth ' + of.growth.toFixed(2) + ' ± ' + of.se.growth.toFixed(2) +
+      ', family +' + of.family.toFixed(2) + ' ± ' + of.se.family.toFixed(2) + '. Value-model growth is fixed at 0.5 per 100% 7d change, not fitted.';
 
-    var econ = document.getElementById('d-econ');
+    var econ = gid('d-econ');
     econ.textContent = '';
     var tb = r.econ.tbill_usd;
-    var tbText = 'vs ' + moneySmall(tb) + ' in a T-bill for the same ' + D.assumptions.tbill_hold_days + '-day hold';
+    var tbText = 'vs T-bill ' + moneySmall(tb) + ' (' + D.assumptions.tbill_hold_days + 'd hold)';
     var verdictNote = r.verdict === 'FARM'
       ? 'FARM — net ' + moneyFull(r.net_usd) + ' ' + tbText + ': clears the bar and the risk-free rate.'
       : r.verdict === 'SKIP'
@@ -286,21 +315,18 @@
     econ.appendChild(head);
     var egrid = el('div', 'econ-grid');
     egrid.innerHTML = [
-      [moneyFull(r.econ.deposit_usd), 'deposit'],
       [moneyFull(r.econ.drop_pool_usd), 'drop pool'],
       [moneyFull(r.econ.farmer_drop_usd), 'modelled drop'],
       [moneySmall(r.econ.fees_usd), 'fees (' + r.econ.txs + ' gas txs at ' + moneySmall(r.econ.gas_per_tx_usd) + ')'],
       [r.econ.hours.toFixed(1) + ' hours', 'time'],
       [moneyFull(r.net_usd), 'net'],
       [money(r.net_per_hour_usd) + '/hr', 'net per hour'],
-      [moneySmall(r.econ.tbill_usd), 'T-bill, ' + D.assumptions.tbill_hold_days + '-day hold'],
     ].map(function (s) { return '<div class="stat"><b>' + s[0] + '</b><span>' + s[1] + '</span></div>'; }).join('');
     econ.appendChild(egrid);
     var as = D.assumptions;
-    econ.appendChild(el('p', 'note', 'Assumptions: drop pool 2% of implied value; the farming pool is 5% of TVL and your share is the deposit over it; gas ' + moneySmall(as.gas_usd.Ethereum) + ' per transaction on Ethereum, ' + moneySmall(as.gas_usd.Solana) + ' on Solana, ' + moneySmall(as.gas_usd.Bitcoin) + ' on Bitcoin, ' + moneySmall(as.gas_default_usd) + ' elsewhere, plus $2 per bridge step; each step counted once, at its stated minutes. FARM: net over $750 and over $500 an hour; SKIP: net under $100. T-bill ' + (as.tbill_rate * 100).toFixed(2) + '% a year (US 3-month Treasury bill, Federal Reserve H.15, ' + as.tbill_as_of + ') over the ' + as.tbill_hold_days + '-day minimum hold.'));
+    econ.appendChild(el('p', 'note', 'Assumptions: drop pool 2% of implied value; farming pool 5% of TVL; gas ' + moneySmall(as.gas_usd.Ethereum) + ' Ethereum, ' + moneySmall(as.gas_usd.Solana) + ' Solana, ' + moneySmall(as.gas_usd.Bitcoin) + ' Bitcoin, ' + moneySmall(as.gas_default_usd) + ' elsewhere, + $2 per bridge step; each step counted once. FARM net > $750 and > $500/hr; SKIP net < $100. T-bill ' + (as.tbill_rate * 100).toFixed(2) + '%/yr (US 3-month, H.15, ' + as.tbill_as_of + '), ' + as.tbill_hold_days + '-day hold.'));
 
-    // ---- deposit × drop-share matrix ---------------------------------------
-    var mx = document.getElementById('d-matrix');
+    var mx = gid('d-matrix');
     mx.innerHTML = '<tr><th>Deposit</th><th class="num">1%</th><th class="num">2%</th><th class="num">5%</th></tr>' +
       [1000, 10000, 50000].map(function (dep) {
         return '<tr><td>' + moneyFull(dep) + '</td>' + [0.01, 0.02, 0.05].map(function (sh) {
@@ -310,35 +336,34 @@
         }).join('') + '</tr>';
       }).join('');
 
-    var farm = document.getElementById('d-farm');
+    var farm = gid('d-farm');
     farm.textContent = '';
     r.farm_steps.forEach(function (s) { farm.appendChild(el('li', null, s)); });
 
-    var peersEl = document.getElementById('d-peers');
-    peersEl.innerHTML = '<tr><th>Protocol</th><th>TVL</th><th>Market cap</th><th>Cap / TVL</th><th>Multiple</th></tr>' +
+    var peersEl = gid('d-peers');
+    peersEl.innerHTML = '<tr><th>Protocol</th><th>TVL</th><th>Market cap</th><th>Cap / TVL</th></tr>' +
       r.peers.map(function (p) {
-        return '<tr><td>' + p.name + (p.same_category ? '' : ' (other category)') + '</td><td class="num">' + money(p.tvl_usd) + '</td><td class="num">' + money(p.mcap_usd) + '</td><td class="num">' + p.cap_tvl.toFixed(2) + '×</td><td class="num">' + p.curve_multiple.toFixed(3) + '×</td></tr>';
+        return '<tr><td>' + esc(p.name) + (p.same_category ? '' : ' (other category)') + '</td><td class="num">' + money(p.tvl_usd) + '</td><td class="num">' + money(p.mcap_usd) + '</td><td class="num">' + p.cap_tvl.toFixed(2) + '×</td></tr>';
       }).join('');
-    document.getElementById('d-peers-title').textContent = 'Nearest priced peers in ' + r.category;
+    gid('d-peers-title').textContent = 'Nearest priced peers in ' + r.category;
 
     detail.hidden = false;
     render();
     detail.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
-  document.getElementById('d-close').addEventListener('click', function () {
+  gid('d-close').addEventListener('click', function () {
     detail.hidden = true;
     activeSlug = null;
     render();
   });
 
-  // ---- controls ----------------------------------------------------------
   document.getElementById('q').addEventListener('input', function (e) { state.q = e.target.value; render(); });
   catSel.addEventListener('change', function (e) { state.cat = e.target.value; render(); });
   chainSel.addEventListener('change', function (e) { state.chain = e.target.value; render(); });
   document.getElementById('minTvl').addEventListener('change', function (e) { state.minTvl = Number(e.target.value); render(); });
   document.getElementById('wl').addEventListener('change', function (e) { state.wl = e.target.checked; render(); });
   document.getElementById('reset').addEventListener('click', function () {
-    state = { q: '', cat: '', chain: '', minTvl: 0, wl: false, sort: 'rank', dir: 1 };
+    state = Object.assign({}, DEF);
     scen = { dep: A.deposit_usd, share: A.drop_pool_pct, gas: 1 };
     document.getElementById('q').value = '';
     catSel.value = ''; chainSel.value = '';
@@ -350,9 +375,9 @@
     syncSliders();
     render();
   });
-  document.getElementById('dep').addEventListener('input', function (e) { scen.dep = Number(e.target.value); syncSliders(); render(); });
-  document.getElementById('share').addEventListener('input', function (e) { scen.share = Number(e.target.value) / 100; syncSliders(); render(); });
-  document.getElementById('gas').addEventListener('input', function (e) { scen.gas = Number(e.target.value); syncSliders(); render(); });
+  [['dep', function (v) { scen.dep = Number(v); }], ['share', function (v) { scen.share = Number(v) / 100; }], ['gas', function (v) { scen.gas = Number(v); }]].forEach(function (s) {
+    document.getElementById(s[0]).addEventListener('input', function (e) { s[1](e.target.value); syncSliders(); render(); });
+  });
   syncSliders();
 
   render();

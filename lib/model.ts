@@ -162,8 +162,12 @@ export interface BoardRow {
   watchlist: boolean;
   if_launches_usd: number;
   token_odds: number;
+  /** Same-category protocols (the family the odds model adjusts for) and how many of them record a token. */
   odds_peers: number;
   odds_peers_with_token: number;
+  /** The family's shrunk residual adjustment (logit scale) for this row's category, and the delta-method s.e. of the row's odds. */
+  odds_family_adj: number;
+  odds_se: number;
   range_lo_usd: number;
   range_hi_usd: number;
   /** Wider range (P10–P90 of the leave-one-out residuals), same construction. */
@@ -199,8 +203,11 @@ export interface Evidence {
   wf_test: number;
   /** How the walk-forward split is made: fitted on tokens listed before the cut, tested on later ones. */
   wf_split: string;
+  /** 10-fold cross-validated Brier of the kept odds model vs the base rate; the walk-forward pair is the second test. */
   brier_odds: number;
   brier_base: number;
+  brier_wf_odds: number;
+  brier_wf_base: number;
 }
 
 /** One row of the term-by-term ablation: the median miss of the model with terms added in order, on both tests. */
@@ -213,13 +220,43 @@ export interface AblationRow {
   note: string;
 }
 
-/** One row of the odds ablation: the Brier score of the peer-group odds as terms are added, on both tests. */
+/** One row of the odds ablation: the Brier score of the logistic odds as terms are added, on both tests (10-fold cross-validation and walk-forward). */
 export interface OddsAblationRow {
   label: string;
-  loo_brier: number;
+  cv_brier: number;
   wf_brier: number;
   /** 'kept' | 'dropped': the keep-rule's verdict for this odds term. */
   verdict: string;
+  note: string;
+}
+
+/** The fitted odds logits with their Fisher standard errors (second-stage logistic fit). */
+export interface OddsFit {
+  intercept: number;
+  age: number;
+  size: number;
+  growth: number;
+  family: number;
+  se: { intercept: number; age: number; size: number; growth: number; family: number };
+}
+
+/** Odds calibration by decile of predicted probability: predicted vs actual token rate per decile. */
+export interface OddsCalibration {
+  deciles: { pred: number; actual: number; n: number }[];
+}
+
+/** A control row that must NOT help: a nonsense term, scored on both tests. */
+export interface ControlRow {
+  label: string;
+  loo_miss: number;
+  wf_miss: number;
+  note: string;
+}
+
+export interface OddsControlRow {
+  label: string;
+  cv_brier: number;
+  wf_brier: number;
   note: string;
 }
 
@@ -270,7 +307,6 @@ export interface Assumptions {
   verdict_farm_net_usd: number;
   verdict_farm_per_hour_usd: number;
   verdict_skip_net_usd: number;
-  odds_prior_weight: number;
   /** US 3-month Treasury bill, Federal Reserve H.15, 19 Nov 2026: the opportunity cost of farming. */
   tbill_rate: number;
   tbill_as_of: string;
@@ -298,6 +334,11 @@ export interface RadarData {
   ablation: AblationRow[];
   /** Term-by-term odds ablation (Brier score on both tests) and the range-calibration panel. */
   odds_ablation: OddsAblationRow[];
+  /** The fitted odds logits ± s.e., the odds calibration by decile, and the control rows that must not help. */
+  odds_fit: OddsFit;
+  odds_calibration: OddsCalibration;
+  ablation_control: ControlRow;
+  odds_control: OddsControlRow;
   calibration: Calibration;
   term_ranges: TermRanges;
 }
@@ -312,7 +353,6 @@ export const CATEGORY_SHRINK = 64;
 export const DEPOSIT_USD = 10_000;
 export const DROP_POOL_PCT = 0.02;
 export const FARMING_POOL_PCT = 0.05;
-export const ODDS_PRIOR_WEIGHT = 20;
 export const VERDICT_FARM_NET_USD = 750;
 export const VERDICT_FARM_PER_HOUR_USD = 500;
 export const VERDICT_SKIP_NET_USD = 100;
@@ -709,6 +749,269 @@ function ols(xs: number[], ys: number[]): Ols {
   return { slope, intercept, r2: sst === 0 ? 0 : 1 - ssr / sst };
 }
 
+/** Logistic regression for the token odds, fitted by IRLS. */
+function sigmoid(x: number): number {
+  return 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, x))));
+}
+
+/** Solve A x = b by Gauss-Jordan with partial pivoting. */
+function solveLinear(A: number[][], b: number[]): number[] {
+  const n = A.length;
+  const M = A.map((row, i) => [...row, b[i]!]);
+  for (let c = 0; c < n; c++) {
+    let piv = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r]![c]!) > Math.abs(M[piv]![c]!)) piv = r;
+    [M[c], M[piv]] = [M[piv]!, M[c]!];
+    const d = M[c]![c]!;
+    for (let j = c; j <= n; j++) M[c]![j]! /= d;
+    for (let r = 0; r < n; r++) {
+      if (r === c) continue;
+      const f = M[r]![c]!;
+      for (let j = c; j <= n; j++) M[r]![j]! -= f * M[c]![j]!;
+    }
+  }
+  return M.map((row) => row[n]!);
+}
+
+/** Invert a small positive-definite matrix by Gauss-Jordan. */
+function invertMatrix(A: number[][]): number[][] {
+  const n = A.length;
+  const M = A.map((row, i) => [...row, ...Array.from({ length: n }, (_, j) => (i === j ? 1 : 0))]);
+  for (let c = 0; c < n; c++) {
+    let piv = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r]![c]!) > Math.abs(M[piv]![c]!)) piv = r;
+    [M[c], M[piv]] = [M[piv]!, M[c]!];
+    const d = M[c]![c]!;
+    for (let j = c; j < 2 * n; j++) M[c]![j]! /= d;
+    for (let r = 0; r < n; r++) {
+      if (r === c) continue;
+      const f = M[r]![c]!;
+      for (let j = c; j < 2 * n; j++) M[r]![j]! -= f * M[c]![j]!;
+    }
+  }
+  return M.map((row) => row.slice(n));
+}
+
+interface LogitFit {
+  beta: number[];
+  cov: number[][];
+  se: number[];
+}
+
+/** IRLS fit of a logistic model; returns the coefficients, the inverse Hessian (covariance) and the Fisher standard errors. */
+function fitLogit(rows: { x: number[]; y: number }[]): LogitFit {
+  const k = rows[0]!.x.length;
+  let beta = new Array<number>(k).fill(0);
+  for (let iter = 0; iter < 60; iter++) {
+    const g = new Array<number>(k).fill(0);
+    const H = Array.from({ length: k }, () => new Array<number>(k).fill(0));
+    for (const r of rows) {
+      const z = r.x.reduce((s, v, i) => s + v * beta[i]!, 0);
+      const p = sigmoid(z);
+      const w = Math.max(1e-6, p * (1 - p));
+      for (let i = 0; i < k; i++) {
+        g[i]! += (r.y - p) * r.x[i]!;
+        for (let j = 0; j < k; j++) H[i]![j]! += w * r.x[i]! * r.x[j]!;
+      }
+    }
+    for (let i = 0; i < k; i++) H[i]![i]! += 1e-4;
+    const step = solveLinear(H, g);
+    let mx = 0;
+    for (let i = 0; i < k; i++) {
+      beta[i]! += step[i]!;
+      mx = Math.max(mx, Math.abs(step[i]!));
+    }
+    if (mx < 1e-8) break;
+  }
+  const Hf = Array.from({ length: k }, () => new Array<number>(k).fill(0));
+  for (const r of rows) {
+    const z = r.x.reduce((s, v, i) => s + v * beta[i]!, 0);
+    const p = sigmoid(z);
+    const w = Math.max(1e-6, p * (1 - p));
+    for (let i = 0; i < k; i++) for (let j = 0; j < k; j++) Hf[i]![j]! += w * r.x[i]! * r.x[j]!;
+  }
+  for (let i = 0; i < k; i++) Hf[i]![i]! += 1e-4;
+  const cov = invertMatrix(Hf);
+  return { beta, cov, se: cov.map((row, i) => Math.sqrt(Math.max(0, row[i]!))) };
+}
+
+/** Which terms the odds logistic carries. The family term is a two-stage adjustment (see fitOddsPipeline). */
+export interface OddsTerms {
+  age: boolean;
+  family: boolean;
+  size: boolean;
+  growth: boolean;
+}
+
+/** Family adjustments shrink toward 0 by n/(n+16): a category's residual rate only counts with peers behind it. */
+export const ODDS_SHRINK = 16;
+
+export interface OddsModel {
+  terms: OddsTerms;
+  beta: number[];
+  cov: number[][];
+  se: number[];
+  catAdj: Map<string, number>;
+  medianAge: number;
+  asOf: string;
+  labels: Map<string, string> | null;
+  predict(p: Protocol): number;
+  oddsSe(p: Protocol): number;
+}
+
+/**
+ * The odds model, in two stages. Stage 1 fits a logistic on age, size and
+ * growth. Stage 2 takes each category's shrunk mean residual from stage 1
+ * — the family adjustment: how much more or less often this category
+ * records a token than its age, size and growth predict — and refits with
+ * it as a covariate. The adjustment is computed from the training set only,
+ * so a protocol never scores itself through its family.
+ */
+function fitOddsPipeline(
+  train: Protocol[],
+  asOf: string,
+  medianAge: number,
+  terms: OddsTerms,
+  labels: Map<string, string> | null = null,
+): OddsModel {
+  const catOf = (p: Protocol): string => labels?.get(p.slug) ?? (p.category ?? '(none)');
+  const feat = (p: Protocol, t: OddsTerms, adj: Map<string, number> | null): number[] => {
+    const x = [1];
+    if (t.age) x.push(ageYears(p, asOf, medianAge));
+    if (t.size) x.push(Math.log(Math.max(1, p.tvl_usd) / 1e8));
+    if (t.growth) x.push(p.change_7d === null ? 0 : Math.max(-1, Math.min(1, p.change_7d / 100)));
+    if (t.family) x.push(adj?.get(catOf(p)) ?? 0);
+    return x;
+  };
+  const baseTerms: OddsTerms = { ...terms, family: false };
+  const base = fitLogit(train.map((p) => ({ x: feat(p, baseTerms, null), y: recordsToken(p) ? 1 : 0 })));
+  let catAdj = new Map<string, number>();
+  if (terms.family) {
+    const res = new Map<string, number[]>();
+    for (const p of train) {
+      const z = feat(p, baseTerms, null).reduce((s, v, i) => s + v * base.beta[i]!, 0);
+      const r = (recordsToken(p) ? 1 : 0) - sigmoid(z);
+      const k = catOf(p);
+      if (!res.has(k)) res.set(k, []);
+      res.get(k)!.push(r);
+    }
+    for (const [k, rs] of res) {
+      const m = rs.reduce((s, x) => s + x, 0) / rs.length;
+      catAdj.set(k, (m * rs.length) / (rs.length + ODDS_SHRINK));
+    }
+  }
+  const finalFit = terms.family
+    ? fitLogit(train.map((p) => ({ x: feat(p, terms, catAdj), y: recordsToken(p) ? 1 : 0 })))
+    : base;
+  const model: OddsModel = {
+    terms,
+    beta: finalFit.beta,
+    cov: finalFit.cov,
+    se: finalFit.se,
+    catAdj,
+    medianAge,
+    asOf,
+    labels,
+    predict(p: Protocol): number {
+      const z = feat(p, terms, catAdj).reduce((s, v, i) => s + v * finalFit.beta[i]!, 0);
+      return sigmoid(z);
+    },
+    oddsSe(p: Protocol): number {
+      const x = feat(p, terms, catAdj);
+      const o = model.predict(p);
+      let v = 0;
+      for (let i = 0; i < x.length; i++) {
+        for (let j = 0; j < x.length; j++) v += x[i]! * finalFit.cov[i]![j]! * x[j]!;
+      }
+      return o * (1 - o) * Math.sqrt(Math.max(0, v));
+    },
+  };
+  return model;
+}
+
+/** Brier score of a fitted odds model on a pool of protocols. */
+function brierOfModel(model: OddsModel, pool: Protocol[]): number {
+  let s = 0;
+  for (const p of pool) {
+    const o = model.predict(p);
+    const t = recordsToken(p) ? 1 : 0;
+    s += (o - t) * (o - t);
+  }
+  return s / Math.max(1, pool.length);
+}
+
+/** 10-fold cross-validated Brier: the pipeline is refitted inside every fold, so the family adjustment never sees the scored protocol. Deterministic shuffle, fixed seed. */
+function cvBrier(
+  all: Protocol[],
+  asOf: string,
+  medianAge: number,
+  terms: OddsTerms,
+  labels: Map<string, string> | null = null,
+  folds = 10,
+): number {
+  const rand = mulberry32(20261122);
+  const idx = all.map((_, i) => i);
+  for (let i = idx.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [idx[i], idx[j]] = [idx[j]!, idx[i]!];
+  }
+  let s = 0;
+  for (let f = 0; f < folds; f++) {
+    const test = idx.filter((_, k) => k % folds === f).map((i) => all[i]!);
+    const train = idx.filter((_, k) => k % folds !== f).map((i) => all[i]!);
+    const model = fitOddsPipeline(train, asOf, medianAge, terms, labels);
+    for (const p of test) {
+      const o = model.predict(p);
+      const t = recordsToken(p) ? 1 : 0;
+      s += (o - t) * (o - t);
+    }
+  }
+  return s / all.length;
+}
+
+/** Walk-forward Brier: fit on the training protocols only, score the later-listed ones. */
+function wfBrier(
+  train: Protocol[],
+  test: Protocol[],
+  asOf: string,
+  medianAge: number,
+  terms: OddsTerms,
+  labels: Map<string, string> | null = null,
+): number {
+  const model = fitOddsPipeline(train, asOf, medianAge, terms, labels);
+  return brierOfModel(model, test);
+}
+
+/** A shuffled copy of the category labels, keyed by slug: the control's nonsense family. Deterministic, fixed seed. */
+function shuffledLabels(all: Protocol[], seed: number): Map<string, string> {
+  const cats = all.map((p) => p.category ?? '(none)');
+  const rand = mulberry32(seed);
+  for (let i = cats.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [cats[i], cats[j]] = [cats[j]!, cats[i]!];
+  }
+  const out = new Map<string, string>();
+  all.forEach((p, i) => out.set(p.slug, cats[i]!));
+  return out;
+}
+
+/** Odds calibration by decile of predicted probability: mean predicted vs actual token rate per decile. */
+function oddsDeciles(model: OddsModel, all: Protocol[]): { pred: number; actual: number; n: number }[] {
+  const scored = all
+    .map((p) => ({ o: model.predict(p), t: recordsToken(p) ? 1 : 0 }))
+    .sort((a, b) => a.o - b.o);
+  const out: { pred: number; actual: number; n: number }[] = [];
+  for (let d = 0; d < 10; d++) {
+    const chunk = scored.slice(Math.floor((d * scored.length) / 10), Math.floor(((d + 1) * scored.length) / 10));
+    out.push({
+      pred: chunk.reduce((s, r) => s + r.o, 0) / chunk.length,
+      actual: chunk.reduce((s, r) => s + r.t, 0) / chunk.length,
+      n: chunk.length,
+    });
+  }
+  return out;
+}
+
 /** The log-log size curve, fitted at runtime from the trading comps. */
 export function fitCurve(snapshot: Snapshot): CurveFit {
   const comps = fitComps(snapshot);
@@ -844,36 +1147,17 @@ function ageYears(p: Protocol, asOf: string, medianAge: number): number {
   return yearsBetween(p.listed_at, asOf);
 }
 
-/** P(token) from the snapshot's own record: the peer-group rate. Peers share the category and were listed within a year of this one; the rate is shrunk toward the global token rate. The TVL band the v2 odds used was tested and dropped: it shrinks the peer group without lowering the Brier score on either test (see the odds ablation). */
-export function tokenOdds(
-  p: Protocol,
-  snapshot: Snapshot,
-  medianAge: number,
-  globalRate: number,
-): { odds: number; peers: number; peersWithToken: number } {
-  return tokenOddsPool(p, snapshot.protocols, snapshot.as_of, medianAge, globalRate);
-}
-
-/** The peer-group odds over any pool of protocols (the full snapshot, or the walk-forward training set). */
-function tokenOddsPool(
-  p: Protocol,
-  pool: Protocol[],
-  asOf: string,
-  medianAge: number,
-  globalRate: number,
-): { odds: number; peers: number; peersWithToken: number } {
-  const age = ageYears(p, asOf, medianAge);
+/** The row's family: same-category protocols in the snapshot, and how many of them record a token. */
+function familyCounts(p: Protocol, snapshot: Snapshot): { peers: number; withToken: number } {
   let peers = 0;
   let withToken = 0;
-  for (const q of pool) {
+  for (const q of snapshot.protocols) {
     if (q.slug === p.slug) continue;
     if (q.category !== p.category) continue;
-    if (Math.abs(ageYears(q, asOf, medianAge) - age) > 1) continue;
     peers++;
     if (recordsToken(q)) withToken++;
   }
-  const odds = (withToken + ODDS_PRIOR_WEIGHT * globalRate) / (peers + ODDS_PRIOR_WEIGHT);
-  return { odds, peers, peersWithToken: withToken };
+  return { peers, withToken };
 }
 
 /** Quantiles of the peer ratios (mcap / curve-predicted) in the row's category over any comp list, else the global spread. Only used to measure the OLD range construction's calibration. */
@@ -941,6 +1225,8 @@ interface Scored extends Protocol {
   odds: number;
   oddsPeers: number;
   oddsPeersWithToken: number;
+  oddsFamilyAdj: number;
+  oddsSe: number;
   impliedValue: number;
   econ: FarmEconomics;
   verdict: Verdict;
@@ -954,7 +1240,7 @@ function scoreProtocol(
   fit: CurveFit,
   factors: Record<string, { factor: number; comps: number }>,
   medianAge: number,
-  globalRate: number,
+  oddsModel: OddsModel,
 ): Scored {
   const key = p.category ?? '(none)';
   const entry = factors[key];
@@ -968,7 +1254,12 @@ function scoreProtocol(
   // leave-one-out test); it earns its place in the token odds instead.
   // The factor is still computed and shown, so the reader sees the test.
   const ifLaunches = curveValue(fit, p.tvl_usd) * multiple * growthFactor;
-  const { odds, peers, peersWithToken } = tokenOdds(p, snapshot, medianAge, globalRate);
+  // Token odds from the fitted logistic (age, size, growth, family); the
+  // family counts are the row's own category, for the detail view.
+  const odds = oddsModel.predict(p);
+  const { peers, withToken: peersWithToken } = familyCounts(p, snapshot);
+  const oddsFamilyAdj = oddsModel.catAdj.get(p.category ?? '(none)') ?? 0;
+  const oddsSe = oddsModel.oddsSe(p);
   const impliedValue = Math.max(1, Math.min(1e14, Math.round(ifLaunches * odds)));
 
   const plan = farmPlan(p);
@@ -1003,6 +1294,8 @@ function scoreProtocol(
     odds,
     oddsPeers: peers,
     oddsPeersWithToken: peersWithToken,
+    oddsFamilyAdj,
+    oddsSe,
     impliedValue,
     econ: {
       deposit_usd: DEPOSIT_USD,
@@ -1020,24 +1313,38 @@ function scoreProtocol(
   };
 }
 
-/** Held-out evidence for the fitted curve, computed at runtime from the snapshot. */
-function computeEvidence(
+export function computeEvidence(
   snapshot: Snapshot,
   fit: CurveFit,
-): { evidence: Evidence; ablation: AblationRow[]; oddsAblation: OddsAblationRow[]; calibration: Calibration } {
+): {
+  evidence: Evidence;
+  ablation: AblationRow[];
+  oddsAblation: OddsAblationRow[];
+  oddsFit: OddsFit;
+  oddsCalibration: OddsCalibration;
+  ablationControl: ControlRow;
+  oddsControl: OddsControlRow;
+  calibration: Calibration;
+} {
   const comps = fitComps(snapshot);
   const miss = (pred: number, actual: number): number => Math.max(pred / actual, actual / pred);
 
-  // The test comp's own factors (growth, age) and its full-snapshot token
-  // odds, for the ablation's later terms. Odds do not use the curve, so
-  // leaving the comp in the odds' peer group leaks nothing about the fit.
+  // The test comp's own factors (growth, age) and its token odds, for the
+  // ablation's later terms. Odds do not use the curve, so scoring a comp
+  // with the full-fit odds leaks nothing about the curve fit; the
+  // walk-forward full model uses a train-only odds model instead.
   const ages = snapshot.protocols
     .filter((p) => p.listed_at !== null)
     .map((p) => yearsBetween(p.listed_at!, snapshot.as_of));
   const medianAge = median(ages) ?? 1;
   const globalRate = snapshot.protocols.filter(recordsToken).length / snapshot.protocols.length;
+  const trainProtos = snapshot.protocols.filter((p) => p.listed_at !== null && p.listed_at < '2025-01-01');
+  const testProtos = snapshot.protocols.filter((p) => p.listed_at !== null && p.listed_at >= '2025-01-01');
+  const fullTerms: OddsTerms = { age: true, family: true, size: true, growth: true };
+  const oddsModelFull = fitOddsPipeline(snapshot.protocols, snapshot.as_of, medianAge, fullTerms);
+  const oddsModelTrain = fitOddsPipeline(trainProtos, snapshot.as_of, medianAge, fullTerms);
   const compOdds = new Map<string, number>();
-  for (const p of comps) compOdds.set(p.slug, tokenOdds(p, snapshot, medianAge, globalRate).odds);
+  for (const p of comps) compOdds.set(p.slug, oddsModelFull.predict(p));
 
   // Leave-one-out: refit the curve without each comp, predict it; the
   // ablation adds terms in order (curve, +category, +growth, +age, +odds).
@@ -1117,12 +1424,9 @@ function computeEvidence(
 
   // Walk-forward: fit on tokens listed before 2025-01-01, test on later ones.
   // Every term is scored on this split too, with the training set's own
-  // factors and odds — the full model uses train-only peers for its odds.
+  // factors and odds — the full model uses train-only odds.
   const train = comps.filter((p) => p.listed_at !== null && p.listed_at < '2025-01-01');
   const test = comps.filter((p) => p.listed_at !== null && p.listed_at >= '2025-01-01');
-  const trainProtos = snapshot.protocols.filter((p) => p.listed_at !== null && p.listed_at < '2025-01-01');
-  const testProtos = snapshot.protocols.filter((p) => p.listed_at !== null && p.listed_at >= '2025-01-01');
-  const trainRate = trainProtos.filter(recordsToken).length / Math.max(1, trainProtos.length);
   let wfFitted = 0;
   let wfFlat = 0;
   let wfCat = 0;
@@ -1169,8 +1473,7 @@ function computeEvidence(
     wfAge = wfMiss((p) => curvePred(p) * catMult(p) * growthOf(p) * ageOf(p));
     wfFull = wfMiss(
       (p) =>
-        curvePred(p) * catMult(p) * growthOf(p) * ageOf(p) *
-        tokenOddsPool(p, trainProtos, snapshot.as_of, medianAge, trainRate).odds,
+        curvePred(p) * catMult(p) * growthOf(p) * ageOf(p) * oddsModelTrain.predict(p),
     );
     // Walk-forward calibration: the LOO residual quantiles applied to the
     // kept-model prediction on later listings, beside the old construction.
@@ -1194,57 +1497,63 @@ function computeEvidence(
     }
   }
 
-  // Odds, term by term: each variant is a peer definition. Leave-one-out
-  // is free — the peer loop skips the protocol itself. Walk-forward uses
-  // only earlier-listed protocols as peers, with the training set's rate.
-  const oddsWith = (p: Protocol, pool: Protocol[], rate: number, terms: string[]): number => {
-    const age = ageYears(p, snapshot.as_of, medianAge);
-    const logTvl = Math.log10(Math.max(1, p.tvl_usd));
-    let peers = 0;
-    let withToken = 0;
-    for (const q of pool) {
-      if (q.slug === p.slug) continue;
-      if (terms.includes('cat') && q.category !== p.category) continue;
-      if (terms.includes('age') && Math.abs(ageYears(q, snapshot.as_of, medianAge) - age) > 1) continue;
-      if (terms.includes('size') && Math.abs(Math.log10(Math.max(1, q.tvl_usd)) - logTvl) > 1) continue;
-      if (terms.includes('growth') && p.change_7d !== null && q.change_7d !== null && Math.sign(q.change_7d) !== Math.sign(p.change_7d)) continue;
-      peers++;
-      if (recordsToken(q)) withToken++;
-    }
-    return (withToken + ODDS_PRIOR_WEIGHT * rate) / (peers + ODDS_PRIOR_WEIGHT);
-  };
-  const brierOf = (testPool: Protocol[], rate: number, terms: string[]): { loo: number; wf: number } => {
-    let loo = 0;
-    for (const p of snapshot.protocols) {
-      const o = terms.length === 0 ? rate : oddsWith(p, snapshot.protocols, rate, terms);
-      const t = recordsToken(p) ? 1 : 0;
-      loo += (o - t) * (o - t);
-    }
-    let wf = 0;
-    for (const p of testPool) {
-      const o = terms.length === 0 ? trainRate : oddsWith(p, trainProtos, trainRate, terms);
-      const t = recordsToken(p) ? 1 : 0;
-      wf += (o - t) * (o - t);
-    }
-    return { loo: loo / snapshot.protocols.length, wf: wf / Math.max(1, testPool.length) };
-  };
-  const oddsVariants: { label: string; terms: string[]; note: string }[] = [
-    { label: 'Base rate', terms: [], note: 'global token rate' },
-    { label: '+ category', terms: ['cat'], note: 'peers in the same category' },
-    { label: '+ age', terms: ['cat', 'age'], note: 'listed within a year — the kept odds' },
-    { label: '+ size (TVL band)', terms: ['cat', 'age', 'size'], note: 'within one decade of TVL' },
-    { label: '+ growth (7d sign)', terms: ['cat', 'age', 'size', 'growth'], note: 'same sign of 7d change' },
+  // Odds, term by term: a logistic model on the snapshot's own record.
+  // Each variant is refitted inside every fold (10-fold cross-validation)
+  // and on the walk-forward training set only, so the family adjustment
+  // never sees the protocol it scores. The keep-rule is the same: a term
+  // stays only if it lowers the Brier score on both tests.
+  const allProtos = snapshot.protocols;
+  const oddsVariants: { label: string; terms: OddsTerms; note: string }[] = [
+    { label: 'Base rate', terms: { age: false, family: false, size: false, growth: false }, note: 'global token rate' },
+    { label: '+ age (years listed)', terms: { age: true, family: false, size: false, growth: false }, note: 'older protocols record tokens more often' },
+    { label: '+ family (category)', terms: { age: true, family: true, size: false, growth: false }, note: 'shrunk category residual, n/(n+16)' },
+    { label: '+ size (ln TVL)', terms: { age: true, family: true, size: true, growth: false }, note: 'bigger protocols record tokens more often' },
+    { label: '+ growth (7d change)', terms: { age: true, family: true, size: true, growth: true }, note: 'recent TVL growth, clamped ±100%' },
   ];
-  const oddsBriers = oddsVariants.map((v) => brierOf(testProtos, globalRate, v.terms));
+  const oddsBriers = oddsVariants.map((v) => ({
+    cv: cvBrier(allProtos, snapshot.as_of, medianAge, v.terms),
+    wf: wfBrier(trainProtos, testProtos, snapshot.as_of, medianAge, v.terms),
+  }));
   const oddsAblation: OddsAblationRow[] = oddsVariants.map((v, i) => {
     const b = oddsBriers[i]!;
     const prev = i === 0 ? null : oddsBriers[i - 1]!;
-    const verdict = i === 0 ? 'baseline' : b.loo < prev.loo && b.wf < prev.wf ? 'kept' : 'dropped';
-    return { label: v.label, loo_brier: b.loo, wf_brier: b.wf, verdict, note: v.note };
+    const verdict = i === 0 ? 'baseline' : b.cv < prev.cv && b.wf < prev.wf ? 'kept' : 'dropped';
+    return { label: v.label, cv_brier: b.cv, wf_brier: b.wf, verdict, note: v.note };
   });
-  // The kept odds are category + age (index 2); the base rate is index 0.
-  const brier = oddsBriers[2]!.loo;
-  const brierBase = oddsBriers[0]!.loo;
+  // The kept odds are the full model (index 4); the base rate is index 0.
+  const brier = oddsBriers[4]!.cv;
+  const brierBase = oddsBriers[0]!.cv;
+  const brierWf = oddsBriers[4]!.wf;
+  const brierWfBase = oddsBriers[0]!.wf;
+
+  // The fitted odds model on the whole snapshot: logits ± s.e. and the
+  // calibration by decile, for the detail view.
+  const oddsFit: OddsFit = {
+    intercept: oddsModelFull.beta[0]!,
+    age: oddsModelFull.beta[1]!,
+    size: oddsModelFull.beta[2]!,
+    growth: oddsModelFull.beta[3]!,
+    family: oddsModelFull.beta[4]!,
+    se: {
+      intercept: oddsModelFull.se[0]!,
+      age: oddsModelFull.se[1]!,
+      size: oddsModelFull.se[2]!,
+      growth: oddsModelFull.se[3]!,
+      family: oddsModelFull.se[4]!,
+    },
+  };
+  const oddsCalibration: OddsCalibration = { deciles: oddsDeciles(oddsModelFull, allProtos) };
+
+  // Controls that must NOT help. Value: the size curve with a shuffled
+  // category factor. Odds: the full logistic with a shuffled family.
+  const shuffled = shuffledLabels(allProtos, 20261122);
+  const oddsControl: OddsControlRow = {
+    label: 'CONTROL — family shuffled',
+    cv_brier: cvBrier(allProtos, snapshot.as_of, medianAge, fullTerms, shuffled),
+    wf_brier: wfBrier(trainProtos, testProtos, snapshot.as_of, medianAge, fullTerms, shuffled),
+    note: 'same terms, shuffled family — must not beat +age',
+  };
+  const ablationControl: ControlRow = valueControl(snapshot, fit, comps, train, test);
 
   // Term-by-term ablation: the median miss as each term is added, on both
   // tests. The odds term is read honestly: it converts the if-launches
@@ -1299,10 +1608,79 @@ function computeEvidence(
       wf_split: 'listed before 2025-01-01, tested on 2025-01-01 or later',
       brier_odds: brier,
       brier_base: brierBase,
+      brier_wf_odds: brierWf,
+      brier_wf_base: brierWfBase,
     },
     ablation,
     oddsAblation,
+    oddsFit,
+    oddsCalibration,
+    ablationControl,
+    oddsControl,
     calibration,
+  };
+}
+
+/**
+ * The value control: the size curve with a shuffled category factor. The
+ * labels are shuffled once (seeded), then the factor is scored on both
+ * tests exactly like the real category term. A nonsense grouping must not
+ * beat the curve on its own — if it did, the harness would be broken.
+ */
+function valueControl(
+  snapshot: Snapshot,
+  fit: CurveFit,
+  comps: Protocol[],
+  train: Protocol[],
+  test: Protocol[],
+): ControlRow {
+  const shuffled = shuffledLabels(comps, 20261122);
+  const miss = (pred: number, actual: number): number => Math.max(pred / actual, actual / pred);
+  const stub = (f: Ols): CurveFit => ({
+    slope: f.slope,
+    intercept: f.intercept,
+    r2: 0,
+    n_comps: 0,
+    multiple_at_100m: 0,
+    slope_se: 0,
+    multiple_se: 0,
+  });
+  const loo: number[] = [];
+  for (let i = 0; i < comps.length; i++) {
+    const rest = comps.filter((_, j) => j !== i);
+    const f = ols(
+      rest.map((p) => Math.log(p.tvl_usd)),
+      rest.map((p) => Math.log(p.mcap_usd!)),
+    );
+    const testComp = comps[i]!;
+    const relabeled = rest.map((p) => ({ ...p, category: shuffled.get(p.slug) ?? p.category }));
+    const factors = categoryFactorsFrom(relabeled, stub(f));
+    const key = shuffled.get(testComp.slug) ?? testComp.category ?? '(none)';
+    const mult = factors[key] !== undefined ? factors[key]!.factor : 1;
+    loo.push(miss(Math.exp(f.intercept + f.slope * Math.log(testComp.tvl_usd)) * mult, testComp.mcap_usd!));
+  }
+  let wf = 0;
+  if (train.length >= 5 && test.length >= 1) {
+    const f = ols(
+      train.map((p) => Math.log(p.tvl_usd)),
+      train.map((p) => Math.log(p.mcap_usd!)),
+    );
+    const relabeled = train.map((p) => ({ ...p, category: shuffled.get(p.slug) ?? p.category }));
+    const factors = categoryFactorsFrom(relabeled, stub(f));
+    wf =
+      median(
+        test.map((p) => {
+          const key = shuffled.get(p.slug) ?? p.category ?? '(none)';
+          const mult = factors[key] !== undefined ? factors[key]!.factor : 1;
+          return miss(Math.exp(f.intercept + f.slope * Math.log(p.tvl_usd)) * mult, p.mcap_usd!);
+        }),
+      ) ?? 0;
+  }
+  return {
+    label: 'CONTROL — category shuffled',
+    loo_miss: median(loo) ?? 0,
+    wf_miss: wf,
+    note: 'shuffled labels must not beat the curve',
   };
 }
 
@@ -1313,7 +1691,6 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     .filter((p) => p.listed_at !== null)
     .map((p) => yearsBetween(p.listed_at!, snapshot.as_of));
   const medianAge = median(ages) ?? 1;
-  const globalRate = snapshot.protocols.filter(recordsToken).length / snapshot.protocols.length;
   const globalMultiple =
     median(fitComps(snapshot).map((p) => p.mcap_usd! / p.tvl_usd)) ?? 0;
   const categoryMultiples: Record<string, number> = {};
@@ -1321,11 +1698,20 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
 
   const watchlistSet = new Set(snapshot.watchlist);
 
+  // The odds model, fitted once on the whole snapshot: every row's odds
+  // come from this one logistic, so the board is consistent.
+  const oddsModel = fitOddsPipeline(snapshot.protocols, snapshot.as_of, medianAge, {
+    age: true,
+    family: true,
+    size: true,
+    growth: true,
+  });
+
   // Every strict-clean pre-token protocol in the snapshot: the watchlist
   // plus all the rest, whatever the floor. That is the whole board.
   const candidates = snapshot.protocols.filter(isCleanPreToken);
   const scored = candidates.map((p) =>
-    scoreProtocol(p, snapshot, fit, factors, medianAge, globalRate),
+    scoreProtocol(p, snapshot, fit, factors, medianAge, oddsModel),
   );
   scored.sort(
     (a, b) =>
@@ -1344,7 +1730,8 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
 
   // Held-out evidence first: the board's ranges are built from the
   // leave-one-out residual quantiles, so they need the evidence.
-  const { evidence, ablation, oddsAblation, calibration } = computeEvidence(snapshot, fit);
+  const { evidence, ablation, oddsAblation, oddsFit, oddsCalibration, ablationControl, oddsControl, calibration } =
+    computeEvidence(snapshot, fit);
 
   // Bootstrap rank ranges: how sure is each rank? 200 refits of the curve.
   const boot = bootstrapRanks(snapshot, scored);
@@ -1381,6 +1768,8 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       token_odds: s.odds,
       odds_peers: s.oddsPeers,
       odds_peers_with_token: s.oddsPeersWithToken,
+      odds_family_adj: s.oddsFamilyAdj,
+      odds_se: s.oddsSe,
       range_lo_usd: rangeLo,
       range_hi_usd: rangeHi,
       range_p10_usd: rangeP10,
@@ -1439,7 +1828,6 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       verdict_farm_net_usd: VERDICT_FARM_NET_USD,
       verdict_farm_per_hour_usd: VERDICT_FARM_PER_HOUR_USD,
       verdict_skip_net_usd: VERDICT_SKIP_NET_USD,
-      odds_prior_weight: ODDS_PRIOR_WEIGHT,
       tbill_rate: TBILL_RATE,
       tbill_as_of: TBILL_AS_OF,
       tbill_hold_days: TBILL_HOLD_DAYS,
@@ -1448,6 +1836,10 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     },
     ablation,
     odds_ablation: oddsAblation,
+    odds_fit: oddsFit,
+    odds_calibration: oddsCalibration,
+    ablation_control: ablationControl,
+    odds_control: oddsControl,
     calibration,
     term_ranges: termRanges,
   };
